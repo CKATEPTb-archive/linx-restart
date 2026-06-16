@@ -4,7 +4,7 @@ import {
   bluetoothCapabilities,
   deviceRecordFromBluetoothDevice,
 } from '../ble-client';
-import type { DeviceRecord, LogLevel } from '../ble-client';
+import type { DeviceRecord, LogLevel, OpcodeCommandResult } from '../ble-client';
 import {
   extractSerialFromName,
   normalizeSerial,
@@ -36,6 +36,7 @@ export function useLinxResetApp(): LinxResetViewModel {
   const [busy, setBusy] = createSignal(false);
   const [authenticated, setAuthenticated] = createSignal(false);
   const [resetSent, setResetSent] = createSignal(false);
+  const [opcodeCommandResults, setOpcodeCommandResults] = createSignal<OpcodeCommandResult[]>([]);
   const [connection, setConnection] = createSignal<ConnectionState>({ label: 'Ожидание', mode: 'idle' });
   const [logText, setLogText] = createSignal('');
   const [logOpen, setLogOpen] = createSignal(false);
@@ -50,6 +51,11 @@ export function useLinxResetApp(): LinxResetViewModel {
   const resetDisabled = createMemo(() => (
     busy() ||
     resetSent() ||
+    !authenticated() ||
+    normalizedSerial().length < 8
+  ));
+  const opcodeSendDisabled = createMemo(() => (
+    busy() ||
     !authenticated() ||
     normalizedSerial().length < 8
   ));
@@ -145,6 +151,20 @@ export function useLinxResetApp(): LinxResetViewModel {
     }
   }
 
+  async function sendOpcodeCommand(opcode: number, params: number[], timeoutMs: number): Promise<void> {
+    try {
+      const label = `OP ${opcode.toString(16).padStart(2, '0').toUpperCase()}`;
+      setBusyState(true, label);
+      const result = await client.sendOpcodeCommand(opcode, params, timeoutMs);
+      setOpcodeCommandResults((current) => [result, ...current].slice(0, 32));
+      setConnectionState(opcodeResultLabel(result), result.status === 'error' ? 'error' : 'ready');
+    } catch {
+      setConnectionState('Ошибка', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const selectedHandler = (event: Event) => {
     const detail = (event as CustomEvent<SelectedEventDetail>).detail;
     const nextSerial = detail.serial || extractSerialFromName(detail.device?.name || '');
@@ -214,9 +234,12 @@ export function useLinxResetApp(): LinxResetViewModel {
     logOpen,
     logSummary,
     logText,
+    opcodeCommandResults,
+    opcodeSendDisabled,
     platform,
     resetDisabled,
     resetSent,
+    sendOpcodeCommand,
     selectedLabel,
     sensorRows,
     support,
@@ -226,5 +249,16 @@ export function useLinxResetApp(): LinxResetViewModel {
 }
 
 function isExchangeLog(message: string): boolean {
-  return /^(TX|RX|OK|ERR|GATT|KEY|CCCD|DIS|F00[123]|F001\/bonding|Primary services|PARSE)\b/.test(message);
+  return /^(TX|RX|OK|ERR|GATT|KEY|CCCD|DIS|F00[123]|F001\/bonding|Primary services|PARSE|LAB)\b/.test(message);
+}
+
+function opcodeResultLabel(result: OpcodeCommandResult): string {
+  switch (result.status) {
+    case 'ok':
+      return 'OP ok';
+    case 'warn':
+      return 'OP warn';
+    default:
+      return 'Ошибка';
+  }
 }

@@ -66,6 +66,17 @@ export interface SensorInfo {
   lastFrameAtMs: number | null;
 }
 
+export type OpcodeCommandResultStatus = 'ok' | 'warn' | 'error';
+
+export interface OpcodeCommandResult {
+  opcode: number;
+  opcodeHex: string;
+  status: OpcodeCommandResultStatus;
+  statusByte: number | null;
+  detail: string;
+  plainHex: string;
+}
+
 interface LinxPacket {
   uuid: string;
   raw: Uint8Array;
@@ -539,6 +550,52 @@ export class LinxBleClient extends EventTarget {
     return this.finishLegacyReset();
   }
 
+  async sendOpcodeCommand(opcode: number, params: number[] = [], timeoutMs: number = TIMEOUTS.commandAck): Promise<OpcodeCommandResult> {
+    if (!this.authenticated) {
+      throw new Error('Сначала выполните подключение и обмен ключами');
+    }
+
+    if (!this.connected) {
+      await this.reconnectAfterClearStorage();
+    }
+
+    const normalizedOpcode = opcode & 0xff;
+    this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'reset' } }));
+    this.log(`LAB send: opcode=${opcodeHex(normalizedOpcode)} params=${formatTraceBytes(Uint8Array.from(params))}`, 'warn');
+
+    try {
+      const response = await this.sendF002Command(
+        normalizedOpcode,
+        () => this.requireCommandBuilder().encrypted(normalizedOpcode, params),
+        timeoutMs,
+      );
+      const plain = requirePlainPacket(response);
+      const statusByte = plain.length >= 2 ? plain[1] : null;
+      const resultStatus = statusByte === 0x00 ? 'ok' : 'warn';
+      const result: OpcodeCommandResult = {
+        opcode: normalizedOpcode,
+        opcodeHex: opcodeHex(normalizedOpcode),
+        status: resultStatus,
+        statusByte,
+        detail: statusByte === null ? 'response without status byte' : `byte1=${opcodeHex(statusByte)}`,
+        plainHex: bytesToHex(plain),
+      };
+      this.log(`LAB result: opcode=${result.opcodeHex} ${result.detail}`, resultStatus === 'ok' ? 'info' : 'warn');
+      return result;
+    } catch (error) {
+      const result: OpcodeCommandResult = {
+        opcode: normalizedOpcode,
+        opcodeHex: opcodeHex(normalizedOpcode),
+        status: 'error',
+        statusByte: null,
+        detail: describeError(error),
+        plainHex: '',
+      };
+      this.log(`LAB error: opcode=${result.opcodeHex} ${result.detail}`, 'error');
+      return result;
+    }
+  }
+
   async finishLegacyReset(): Promise<{ confirmed: boolean }> {
     const commandBuilder = this.requireCommandBuilder();
 
@@ -618,18 +675,26 @@ export class LinxBleClient extends EventTarget {
   async sendF002CommandStatus(
     opcode: number,
     buildCommand: F002CommandBuilder,
-    timeoutMs = TIMEOUTS.commandAck,
+    timeoutMs: number = TIMEOUTS.commandAck,
   ): Promise<number> {
+    const response = await this.sendF002Command(opcode, buildCommand, timeoutMs);
+    const plain = requirePlainPacket(response);
+    const status = plain[1] ?? 0xff;
+    this.log(formatStatusLine('RX', CHAR_F002, opcode, status));
+    return status;
+  }
+
+  async sendF002Command(
+    opcode: number,
+    buildCommand: F002CommandBuilder,
+    timeoutMs: number = TIMEOUTS.commandAck,
+  ): Promise<LinxPacket> {
     const f002 = this.requireCharacteristic(CHAR_F002);
     const command = await buildCommand();
     const responsePromise = this.waitForF002OpcodeWithReadFallback(opcode, timeoutMs);
     responsePromise.catch(() => undefined);
     await this.writeCharacteristic(f002, command, opcodeDescription(opcode), 'enc');
-    const response = await responsePromise;
-    const plain = requirePlainPacket(response);
-    const status = plain[1] ?? 0xff;
-    this.log(formatStatusLine('RX', CHAR_F002, opcode, status));
-    return status;
+    return responsePromise;
   }
 
   async requestSensorInfo(): Promise<void> {

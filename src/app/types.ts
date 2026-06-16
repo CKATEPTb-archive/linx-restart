@@ -1,5 +1,5 @@
 import type { Accessor } from 'solid-js';
-import type { LogLevel, SensorInfo } from '../ble-client';
+import type { LogLevel, OpcodeCommandResult, SensorInfo } from '../ble-client';
 import type { PlatformInfo, SupportDetails } from '../platform-support';
 
 export type ConnectionMode = 'idle' | 'busy' | 'ready' | 'error';
@@ -48,9 +48,12 @@ export interface LinxResetViewModel {
   logSummary: Accessor<LogSummary>;
   logText: Accessor<string>;
   logOpen: Accessor<boolean>;
+  opcodeCommandResults: Accessor<OpcodeCommandResult[]>;
+  opcodeSendDisabled: Accessor<boolean>;
   platform: Accessor<PlatformInfo>;
   resetDisabled: Accessor<boolean>;
   resetSent: Accessor<boolean>;
+  sendOpcodeCommand: (opcode: number, params: number[], timeoutMs: number) => Promise<void>;
   selectedLabel: Accessor<string>;
   sensorRows: Accessor<SensorRow[]>;
   support: Accessor<SupportDetails>;

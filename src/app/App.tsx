@@ -7,12 +7,14 @@ import { Disclaimer } from '../components/Disclaimer';
 import { LogPanel } from '../components/LogPanel';
 import { PreparationStep } from '../components/PreparationStep';
 import { ResetCompleteStep } from '../components/ResetCompleteStep';
+import { ResetProbeScreen } from '../components/ResetProbeScreen';
 import { SensorInfoStep } from '../components/SensorInfoStep';
 import { SensorSelectStep } from '../components/SensorSelectStep';
 
 export function App() {
   const viewModel = useLinxResetApp();
   const quiz = useQuizFlow();
+  const resetProbeMode = normalizePath(window.location.pathname) === '/reset';
 
   return (
     <main class="relative mx-auto grid h-dvh w-full max-w-[520px] grid-rows-[auto_minmax(0,1fr)_auto] gap-2 overflow-hidden bg-[linear-gradient(180deg,rgba(21,27,25,0.98),rgba(11,15,14,1)_46%,rgba(10,13,12,1))] px-3 pt-[max(10px,env(safe-area-inset-top))] pb-[max(9px,env(safe-area-inset-bottom))] text-app-ink shadow-[inset_0_0_0_1px_rgba(255,255,255,0.035)]">
@@ -20,11 +22,25 @@ export function App() {
         connection={viewModel.connection}
         logOpen={viewModel.logOpen}
         onStatusClick={viewModel.toggleLog}
-        stepNumber={quiz.stepNumber}
-        totalSteps={quiz.totalSteps}
+        stepNumber={() => resetProbeMode ? 1 : quiz.stepNumber()}
+        totalSteps={resetProbeMode ? 1 : quiz.totalSteps}
       />
 
       <Switch>
+        <Match when={resetProbeMode}>
+          <ResetProbeScreen
+            authenticated={viewModel.authenticated}
+            chooseAndConnect={viewModel.chooseAndConnect}
+            chooseDisabled={viewModel.chooseDisabled}
+            logText={viewModel.logText}
+            opcodeCommandResults={viewModel.opcodeCommandResults}
+            opcodeSendDisabled={viewModel.opcodeSendDisabled}
+            sendOpcodeCommand={viewModel.sendOpcodeCommand}
+            selectedLabel={viewModel.selectedLabel}
+            support={viewModel.support}
+            supportIssue={viewModel.supportIssue}
+          />
+        </Match>
         <Match when={quiz.step() === 'disconnect-active'}>
           <PreparationStep
             canGoBack={quiz.canGoBack()}
@@ -79,4 +95,9 @@ export function App() {
       <Disclaimer />
     </main>
   );
+}
+
+function normalizePath(pathname: string): string {
+  const normalized = pathname.replace(/\/+$/g, '');
+  return normalized || '/';
 }

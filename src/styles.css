@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+@theme {
+  --color-app-bg: #0b0f0e;
+  --color-app-panel: #151b19;
+  --color-app-elevated: #1b2320;
+  --color-app-field: #0f1513;
+  --color-app-border: #2a3631;
+  --color-app-line: #36443e;
+  --color-app-ink: #f3f8f5;
+  --color-app-soft: #dce7e2;
+  --color-app-muted: #9aa9a2;
+  --color-app-dim: #718079;
+  --color-app-log: #cbd8d1;
+  --color-app-accent: #58d8c4;
+  --color-app-accent-ink: #08211d;
+  --color-app-danger: #f36f6f;
+  --color-app-danger-ink: #250606;
+  --color-app-warning: #d8b86c;
+  --color-app-idle: #69766f;
+  --color-app-note: #fff2d5;
+  --color-app-warm: #d2bf76;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    min-height: 100dvh;
+    margin: 0;
+    background:
+      linear-gradient(180deg, rgba(19, 24, 22, 0.92), rgba(11, 15, 14, 1) 54%),
+      var(--color-app-bg);
+    color: var(--color-app-ink);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  button,
+  input {
+    font: inherit;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  h1,
+  h2,
+  p {
+    margin: 0;
+  }
+}
+
+@keyframes aura-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(0.92);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes aura-glow {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.9);
+  }
+
+  50% {
+    opacity: 0.85;
+    transform: scale(1.12);
+  }
+}
+
+@keyframes bluetooth-pulse {
+  0%,
+  100% {
+    transform: scale(0.96);
+  }
+
+  50% {
+    transform: scale(1.05);
+  }
+}
+
+@layer components {
+  .quiz-screenshot-fit {
+    position: absolute;
+    inset: 2px;
+    width: calc(100% - 4px);
+    height: calc(100% - 4px);
+    max-width: none;
+    object-fit: contain;
+  }
+
+  .fancybox__container :is(.fancybox__image, .f-panzoom__content) {
+    clip-path: inset(2px);
+  }
+}
+
+.quiz-carousel.f-carousel {
+  --f-carousel-gap: 0px;
+  --f-carousel-slide-width: 100%;
+  --f-carousel-slide-height: 100%;
+}
+
+.quiz-carousel .f-carousel__viewport {
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.quiz-carousel__slide {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, rgba(27, 35, 32, 0.88), rgba(10, 13, 12, 0.88)),
+    var(--color-app-field);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.055),
+    0 18px 44px rgba(0, 0, 0, 0.28);
+  padding: 0;
+  transition: box-shadow 180ms ease;
+}
+
+.quiz-carousel__slide:focus-visible {
+  box-shadow:
+    0 0 0 2px rgba(79, 209, 189, 0.32),
+    0 18px 42px rgba(0, 0, 0, 0.3);
+}

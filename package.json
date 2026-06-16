@@ -1,0 +1,33 @@
+{
+  "name": "linx-reset-web",
+  "version": "0.1.0",
+  "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "start": "npm run dev",
+    "serve": "tsx server.ts",
+    "serve:https": "npm run build && tsx server.ts --https",
+    "serve:local:https": "tsx scripts/create-local-cert.ts && npm run build && tsx server.ts --https --cert-helper",
+    "start:https": "npm run serve:https",
+    "cert:local": "tsx scripts/create-local-cert.ts",
+    "check": "tsc --noEmit && vite build",
+    "test": "tsx tests/protocol.test.ts"
+  },
+  "dependencies": {
+    "@fancyapps/ui": "^6.1.14",
+    "solid-js": "^1.9.13"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.1",
+    "@types/node": "^25.9.3",
+    "tailwindcss": "^4.3.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-solid": "^2.11.12"
+  }
+}

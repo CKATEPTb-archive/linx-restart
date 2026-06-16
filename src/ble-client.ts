@@ -1,0 +1,1146 @@
+import {
+  AiDexCommandBuilder,
+  AiDexKeyExchange,
+  CHAR_F001,
+  CHAR_F002,
+  CHAR_F003,
+  DEVICE_NAME_PREFIXES,
+  OPCODES,
+  SERVICE_DIS,
+  SERVICE_F000,
+  bluetoothRequestFilters,
+  bytesToHex,
+  extractSerialFromName,
+  inferDeviceModelFromName,
+  isKnownDeviceName,
+  normalizeSerial,
+  parseF003DataFrame,
+  parseF003StatusFrame,
+  parseLocalStartTimeResponse,
+  parseStartupDeviceInfoResponse,
+} from './aidex-protocol';
+import type { ByteInput } from './aidex-protocol';
+
+export type LogLevel = 'info' | 'warn' | 'error';
+
+export interface BluetoothCapabilities {
+  bluetooth: boolean;
+  leScan: boolean;
+  secureContext: boolean;
+}
+
+export interface DeviceRecord {
+  id: string;
+  device: BluetoothDevice;
+  name: string;
+  source: string;
+  serial: string;
+  modelName: string;
+  trusted: boolean;
+  rssi?: number;
+}
+
+export interface SensorInfo {
+  name: string;
+  serial: string;
+  modelName: string;
+  firmwareVersion: string;
+  hardwareVersion: string;
+  wearDays: number;
+  startTimeMs: number | null;
+  startTimeEstimated: boolean;
+  startTimeSource: string;
+  notStarted: boolean;
+  batteryMillivolts: number | null;
+  batteryUpdatedAtMs: number | null;
+  ageMinutes: number | null;
+  selectedAtMs: number | null;
+  updatedAtMs: number | null;
+  lastFrameAtMs: number | null;
+}
+
+interface LinxPacket {
+  uuid: string;
+  raw: Uint8Array;
+  plain: Uint8Array | null;
+  opcode?: number;
+}
+
+interface PacketWaiter {
+  predicate: (packet: LinxPacket) => boolean;
+  resolve: (packet: LinxPacket) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface NotificationHandlerEntry {
+  characteristic: BluetoothRemoteGATTCharacteristic;
+  handler: (event: Event & { target: BluetoothRemoteGATTCharacteristic }) => void;
+}
+
+interface LinxGattError extends Error {
+  linxStage?: string;
+  linxF001Cccd?: boolean;
+}
+
+type F002CommandBuilder = () => Promise<Uint8Array>;
+type DeviceSource = 'chooser' | 'manual' | 'scan';
+type ConnectionStage = 'connect' | 'services' | 'characteristics' | 'cccd' | 'key-exchange';
+type CharacteristicWriteMethodName = 'writeValue' | 'writeValueWithResponse' | 'writeValueWithoutResponse';
+type CharacteristicWriteMethod = (value: BufferSource) => Promise<void>;
+type TraceDirection = 'TX' | 'RX';
+type TraceEncoding = 'raw' | 'enc' | 'plain' | 'read' | 'cccd';
+
+const TIMEOUTS = Object.freeze({
+  pairKey: 20_000,
+  bond: 12_000,
+  commandAck: 18_000,
+  sensorInfo: 5_000,
+});
+
+const GATT_BUSY_RETRIES = 10;
+const GATT_BUSY_DELAY_MS = 300;
+const GATT_SETTLE_DELAY_MS = 700;
+const CONNECT_RETRIES = 2;
+const CONNECT_RETRY_DELAY_MS = 1_500;
+const CCCD_ORDER = [CHAR_F003, CHAR_F002, CHAR_F001];
+
+export class LinxBleClient extends EventTarget {
+  device: BluetoothDevice | null;
+  server: BluetoothRemoteGATTServer | null;
+  service: BluetoothRemoteGATTService | null;
+  characteristics: Map<string, BluetoothRemoteGATTCharacteristic>;
+  keyExchange: AiDexKeyExchange | null;
+  commandBuilder: AiDexCommandBuilder | null;
+  serial: string;
+  waiters: Set<PacketWaiter>;
+  scan: BluetoothLEScan | null;
+  scanHandler: ((event: BluetoothAdvertisingEvent) => void) | null;
+  notificationHandlers: Map<string, NotificationHandlerEntry>;
+  sensorInfo: SensorInfo;
+  handleDisconnect: ((event: Event) => void) | null;
+
+  constructor() {
+    super();
+    this.device = null;
+    this.server = null;
+    this.service = null;
+    this.characteristics = new Map();
+    this.keyExchange = null;
+    this.commandBuilder = null;
+    this.serial = '';
+    this.waiters = new Set();
+    this.scan = null;
+    this.scanHandler = null;
+    this.notificationHandlers = new Map();
+    this.sensorInfo = emptySensorInfo();
+    this.handleDisconnect = null;
+  }
+
+  get connected(): boolean {
+    return Boolean(this.device?.gatt?.connected);
+  }
+
+  get authenticated(): boolean {
+    return Boolean(this.keyExchange?.isComplete);
+  }
+
+  async chooseDevice(): Promise<BluetoothDevice> {
+    const bluetooth = this.assertBluetoothSupport();
+
+    let device: BluetoothDevice;
+    try {
+      device = await bluetooth.requestDevice({
+        filters: bluetoothRequestFilters(),
+        optionalServices: [SERVICE_F000, SERVICE_DIS],
+      });
+    } catch (error) {
+      if (!isUnknownCgmServiceError(error)) {
+        throw error;
+      }
+
+      this.log('WebBLE не принял сервис CGM/181F в optionalServices. Повторяю выбор только по имени устройства.', 'warn');
+      device = await bluetooth.requestDevice({
+        filters: bluetoothRequestFilters(),
+      });
+    }
+
+    this.setDevice(device, 'chooser');
+    return device;
+  }
+
+  async startAdvertisementScan(): Promise<BluetoothLEScan | null> {
+    const bluetooth = this.assertBluetoothSupport();
+
+    if (!bluetooth.requestLEScan) {
+      throw new Error('BLE-скан в браузере недоступен. Используйте кнопку "Выбрать".');
+    }
+
+    if (this.scan) {
+      this.stopAdvertisementScan();
+      return null;
+    }
+
+    this.scanHandler = (event: BluetoothAdvertisingEvent) => {
+      const device = event.device;
+      const name = device?.name || event.name || 'Без имени';
+      const manufacturerIds = event.manufacturerData ? Array.from(event.manufacturerData.keys()) : [];
+      const serviceMatch = event.uuids?.some((uuid: string) => uuid.toLowerCase() === SERVICE_F000) || false;
+      const nameMatch = isKnownDeviceName(name);
+
+      if (!nameMatch && !serviceMatch && manufacturerIds.length === 0) {
+        return;
+      }
+
+      this.dispatchEvent(new CustomEvent('devicefound', {
+        detail: {
+          device,
+          name,
+          id: device.id,
+          rssi: event.rssi,
+          serial: extractSerialFromName(name),
+          trusted: nameMatch || serviceMatch,
+          source: 'scan',
+        },
+      }));
+    };
+
+    bluetooth.addEventListener('advertisementreceived', this.scanHandler);
+    this.scan = await bluetooth.requestLEScan({
+      filters: bluetoothRequestFilters(),
+      keepRepeatedDevices: false,
+    });
+    this.log('BLE scan: start');
+    return this.scan;
+  }
+
+  stopAdvertisementScan(): void {
+    if (this.scan) {
+      this.scan.stop();
+      this.scan = null;
+      this.log('BLE scan: stop');
+    }
+
+    const bluetooth = navigator.bluetooth;
+    if (this.scanHandler && bluetooth) {
+      bluetooth.removeEventListener('advertisementreceived', this.scanHandler);
+      this.scanHandler = null;
+    }
+  }
+
+  setDevice(device: BluetoothDevice, source: DeviceSource = 'manual'): void {
+    if (this.device && this.handleDisconnect) {
+      this.device.removeEventListener('gattserverdisconnected', this.handleDisconnect);
+    }
+
+    this.device = device;
+    this.serial = extractSerialFromName(device?.name || '');
+    this.sensorInfo = {
+      ...emptySensorInfo(),
+      name: device?.name || 'Без имени',
+      serial: this.serial,
+      modelName: inferDeviceModelFromName(device?.name || ''),
+      selectedAtMs: Date.now(),
+    };
+    this.handleDisconnect = () => {
+      this.log('GATT disconnect');
+      this.rejectWaiters(new Error('GATT отключен'));
+      this.dispatchEvent(new CustomEvent('disconnected'));
+    };
+    this.device?.addEventListener('gattserverdisconnected', this.handleDisconnect);
+    this.emitSensorInfo();
+    this.dispatchEvent(new CustomEvent('selected', { detail: { device, source, serial: this.serial } }));
+  }
+
+  async connect(serialOverride = ''): Promise<void> {
+    if (!this.device) {
+      throw new Error('Сначала выберите сенсор');
+    }
+
+    const device = this.device;
+    const serial = normalizeSerial(serialOverride || this.serial || extractSerialFromName(device.name));
+    if (serial.length < 8 || serial.length > 14) {
+      throw new Error('Укажите серийный номер сенсора без префикса X-');
+    }
+
+    this.serial = serial;
+
+    for (let attempt = 0; attempt <= CONNECT_RETRIES; attempt += 1) {
+      let stage: ConnectionStage = 'connect';
+      this.closeGattSession();
+      this.keyExchange = new AiDexKeyExchange(serial);
+      this.commandBuilder = new AiDexCommandBuilder(this.keyExchange);
+      this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'gatt' } }));
+
+      try {
+        const gatt = device.gatt;
+        if (!gatt) {
+          throw new Error('GATT недоступен для выбранного устройства');
+        }
+
+        this.log(`GATT connect: name=${device.name || 'unknown'} id=${device.id}`);
+        this.log(`CCCD order: ${CCCD_ORDER.map(shortUuid).join(',')}`);
+        this.server = await gatt.connect();
+        stage = 'services';
+        this.service = await this.getAiDexService();
+        stage = 'characteristics';
+        await this.cacheCharacteristics();
+        stage = 'cccd';
+        await this.enableNotifications();
+        stage = 'key-exchange';
+        await this.performKeyExchange();
+        this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'key' } }));
+        this.log('KEY session: ready');
+        await this.requestSensorInfo();
+        return;
+      } catch (error) {
+        const isF001CccdFailure = Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
+        const canRetryTransport = !isF001CccdFailure &&
+          isGattDisconnectedError(error) &&
+          attempt < CONNECT_RETRIES;
+
+        if (canRetryTransport) {
+          this.log(`GATT retry: stage=${describeStage(stage)} attempt=${attempt + 1}/${CONNECT_RETRIES}`, 'warn');
+          this.closeGattSession();
+          await delay(CONNECT_RETRY_DELAY_MS * (attempt + 1));
+          continue;
+        }
+
+        this.closeGattSession();
+        if (!this.authenticated && (isAuthenticationError(error) || isGattDisconnectedError(error))) {
+          const detail = isF001CccdFailure ? ' Разрыв произошел на CCCD F001.' : '';
+          this.log(
+            `F001/bonding не завершился.${detail} Web Bluetooth не дает вызвать bonding напрямую.`,
+            'error',
+          );
+        }
+        throw error;
+      }
+    }
+
+    if (!this.authenticated) {
+      const error = new Error('Не удалось подключиться к GATT после повторов');
+      this.log(
+        'F001/bonding не завершился. Web Bluetooth не дает вызвать bonding напрямую.',
+        'error',
+      );
+      throw error;
+    }
+  }
+
+  async getAiDexService(): Promise<BluetoothRemoteGATTService> {
+    const server = this.requireServer();
+    try {
+      return await this.runGattOperation(() => server.getPrimaryService(SERVICE_F000));
+    } catch (error) {
+      if (!isUnknownCgmServiceError(error)) {
+        throw error;
+      }
+
+      this.log('WebBLE не знает имя сервиса Continuous Glucose Monitoring. Ищу 181F через список primary services.', 'warn');
+      if (typeof server.getPrimaryServices !== 'function') {
+        this.log('getPrimaryServices() в этом WebBLE недоступен', 'error');
+        throw error;
+      }
+
+      let services: BluetoothRemoteGATTService[];
+      try {
+        services = await this.runGattOperation(() => server.getPrimaryServices!());
+      } catch (fallbackError) {
+        this.log(`getPrimaryServices() не сработал: ${describeError(fallbackError)}`, 'error');
+        throw fallbackError;
+      }
+
+      this.log(`Primary services: ${services.map((service) => service.uuid || '?').join(', ')}`);
+      const service = services.find((candidate) => sameBluetoothUuid(candidate.uuid, SERVICE_F000));
+      if (!service) {
+        throw new Error('Сервис 181F найден не был среди primary services');
+      }
+
+      return service;
+    }
+  }
+
+  async resetSensor(): Promise<{ confirmed: boolean }> {
+    if (!this.authenticated) {
+      throw new Error('Сначала выполните подключение и обмен ключами');
+    }
+
+    const f002 = this.requireCharacteristic(CHAR_F002);
+    const commandBuilder = this.requireCommandBuilder();
+    const clearAck = this.waitForF002Opcode(OPCODES.CLEAR_STORAGE, TIMEOUTS.commandAck);
+    await this.writeCharacteristic(f002, await commandBuilder.clearStorage(), opcodeDescription(OPCODES.CLEAR_STORAGE), 'enc');
+    const clearResponse = await clearAck;
+    const clearPlain = requirePlainPacket(clearResponse);
+    const clearStatus = clearPlain[1] ?? 0xff;
+    this.log(formatStatusLine('RX', CHAR_F002, OPCODES.CLEAR_STORAGE, clearStatus));
+
+    if (clearStatus !== 0x00) {
+      throw new Error(`CLEAR_STORAGE вернул статус 0x${clearStatus.toString(16).padStart(2, '0')}`);
+    }
+
+    const resetAck = this.waitForF002Opcode(OPCODES.RESET, TIMEOUTS.commandAck);
+    await this.writeCharacteristic(f002, await commandBuilder.reset(), opcodeDescription(OPCODES.RESET), 'enc');
+
+    try {
+      const resetResponse = await resetAck;
+      const resetPlain = requirePlainPacket(resetResponse);
+      const resetStatus = resetPlain[1] ?? 0xff;
+      this.log(formatStatusLine('RX', CHAR_F002, OPCODES.RESET, resetStatus));
+      if (resetStatus !== 0x00) {
+        throw new Error(`RESET вернул статус 0x${resetStatus.toString(16).padStart(2, '0')}`);
+      }
+      this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'reset' } }));
+      return { confirmed: true };
+    } catch (error) {
+      if (!this.connected) {
+        this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'reset' } }));
+        this.log('GATT disconnect after TX F002 0xF0', 'warn');
+        return { confirmed: false };
+      }
+      throw error;
+    }
+  }
+
+  async requestSensorInfo(): Promise<void> {
+    if (!this.authenticated) {
+      return;
+    }
+
+    const commandBuilder = this.requireCommandBuilder();
+    await this.requestOptionalF002Info(
+      OPCODES.GET_STARTUP_DEVICE_INFO,
+      () => commandBuilder.getStartupDeviceInfo(),
+      'информация сенсора 0x10',
+    );
+
+    await this.requestOptionalF002Info(
+      OPCODES.GET_LOCAL_START_TIME,
+      () => commandBuilder.getLocalStartTime(),
+      'время запуска 0x21',
+    );
+  }
+
+  async requestOptionalF002Info(opcode: number, buildCommand: F002CommandBuilder, label: string): Promise<void> {
+    try {
+      const f002 = this.requireCharacteristic(CHAR_F002);
+      const responsePromise = this.waitForF002Opcode(opcode, TIMEOUTS.sensorInfo);
+      await this.writeCharacteristic(f002, await buildCommand(), opcodeDescription(opcode), 'enc');
+      const response = await responsePromise;
+      this.applyF002SensorInfo(response);
+    } catch (error) {
+      this.log(`Не удалось получить ${label}: ${describeError(error)}`, 'warn');
+    }
+  }
+
+  disconnect(): void {
+    this.stopAdvertisementScan();
+    this.rejectWaiters(new Error('Соединение закрыто'));
+    this.closeGattSession();
+    this.keyExchange = null;
+    this.commandBuilder = null;
+  }
+
+  closeGattSession(): void {
+    this.detachNotificationHandlers();
+    try {
+      this.device?.gatt?.disconnect();
+    } catch (_error) {
+      // Ignore disconnect races from the browser BLE stack.
+    }
+    this.characteristics.clear();
+    this.server = null;
+    this.service = null;
+  }
+
+  detachNotificationHandlers(): void {
+    for (const [uuid, entry] of this.notificationHandlers) {
+      entry.characteristic.removeEventListener('characteristicvaluechanged', entry.handler);
+      this.notificationHandlers.delete(uuid);
+    }
+  }
+
+  async forgetDevice(): Promise<{ permissionForgot: boolean }> {
+    const device = this.device;
+    this.disconnect();
+
+    let permissionForgot = false;
+    if (device && typeof device.forget === 'function') {
+      await device.forget();
+      permissionForgot = true;
+    }
+
+    if (device && this.handleDisconnect) {
+      device.removeEventListener('gattserverdisconnected', this.handleDisconnect);
+    }
+
+    this.device = null;
+    this.serial = '';
+    this.dispatchEvent(new CustomEvent('forgot', { detail: { device, permissionForgot } }));
+    return { permissionForgot };
+  }
+
+  async cacheCharacteristics(): Promise<void> {
+    if (!this.service) {
+      throw new Error('Сервис AiDEX не найден');
+    }
+
+    for (const uuid of [CHAR_F001, CHAR_F002, CHAR_F003]) {
+      const characteristic = await this.service.getCharacteristic(uuid);
+      this.characteristics.set(uuid, characteristic);
+    }
+  }
+
+  async enableNotifications(): Promise<void> {
+    this.detachNotificationHandlers();
+
+    for (const uuid of CCCD_ORDER) {
+      const characteristic = this.requireCharacteristic(uuid);
+      this.attachNotificationHandler(uuid, characteristic);
+      this.log(formatControlLine('TX', uuid, 'cccd', 'enable notify'));
+      try {
+        await this.startNotifications(characteristic, uuid);
+      } catch (error) {
+        markGattStageError(error, `cccd:${shortUuid(uuid)}`, uuid === CHAR_F001);
+        throw error;
+      }
+      await delay(GATT_SETTLE_DELAY_MS);
+    }
+  }
+
+  attachNotificationHandler(uuid: string, characteristic: BluetoothRemoteGATTCharacteristic): void {
+    const existing = this.notificationHandlers.get(uuid);
+    if (existing) {
+      existing.characteristic.removeEventListener('characteristicvaluechanged', existing.handler);
+    }
+
+    const handler = (event: Event & { target: BluetoothRemoteGATTCharacteristic }) => {
+      this.handleNotification(uuid, event).catch((error) => this.log(describeError(error), 'error'));
+    };
+    characteristic.addEventListener('characteristicvaluechanged', handler);
+    this.notificationHandlers.set(uuid, { characteristic, handler });
+  }
+
+  async startNotifications(characteristic: BluetoothRemoteGATTCharacteristic, uuid: string): Promise<void> {
+    await this.runGattOperation(() => characteristic.startNotifications());
+    this.log(`OK ${shortUuid(uuid)} cccd (notify ready)`);
+  }
+
+  async writeCharacteristic(
+    characteristic: BluetoothRemoteGATTCharacteristic,
+    bytes: ByteInput,
+    description: string | null = null,
+    encoding: TraceEncoding = 'raw',
+  ): Promise<void> {
+    this.log(formatTraceLine('TX', characteristic.uuid, bytes, description, encoding));
+    await this.runGattOperation(() => writeRawCharacteristic(characteristic, bytes));
+  }
+
+  async runGattOperation<T>(operation: () => Promise<T>): Promise<T> {
+    return withGattRetry(() => this.withDisconnectGuard(operation));
+  }
+
+  async withDisconnectGuard<T>(operation: () => Promise<T>): Promise<T> {
+    const device = this.device;
+    if (!device?.gatt?.connected) {
+      throw new Error('GATT отключен до операции');
+    }
+
+    let disconnectHandler: ((event: Event) => void) | null = null;
+    const disconnectPromise = new Promise<T>((_, reject) => {
+      disconnectHandler = () => reject(new Error('GATT отключен во время операции'));
+      device.addEventListener('gattserverdisconnected', disconnectHandler, { once: true });
+    });
+
+    try {
+      const operationPromise = Promise.resolve().then(operation);
+      operationPromise.catch(() => {});
+      return await Promise.race([operationPromise, disconnectPromise]);
+    } finally {
+      if (disconnectHandler) {
+        device.removeEventListener('gattserverdisconnected', disconnectHandler);
+      }
+    }
+  }
+
+  async refreshPostBondNotifications(): Promise<void> {
+    for (const uuid of [CHAR_F003, CHAR_F002]) {
+      await this.startNotifications(this.requireCharacteristic(uuid), uuid);
+      await delay(GATT_SETTLE_DELAY_MS);
+    }
+    this.log(`CCCD refresh: ${[CHAR_F003, CHAR_F002].map(shortUuid).join(',')}`);
+  }
+
+  async performKeyExchange(): Promise<void> {
+    const f001 = this.requireCharacteristic(CHAR_F001);
+    const f002 = this.requireCharacteristic(CHAR_F002);
+    const keyExchange = this.requireKeyExchange();
+
+    const pairPromise = this.waitForPacket(
+      (packet) => packet.uuid === CHAR_F001 && packet.raw.length >= 16,
+      TIMEOUTS.pairKey,
+    );
+
+    await this.writeCharacteristic(f001, keyExchange.getChallenge(), 'pair challenge', 'raw');
+
+    const pairPacket = await pairPromise;
+    keyExchange.setPairKey(pairPacket.raw);
+
+    this.log(formatControlLine('TX', CHAR_F002, 'read', 'bond read'));
+    const bond = dataViewToBytes(await this.runGattOperation(() => f002.readValue()));
+    this.log(formatTraceLine('RX', CHAR_F002, bond, 'bond data', 'read'));
+    if (bond.length !== 17) {
+      throw new Error(`BOND должен быть 17 байт, получено ${bond.length}`);
+    }
+
+    const bondOk = await keyExchange.decryptBond(bond);
+    if (!bondOk) {
+      throw new Error('BOND не расшифрован или CRC-8 не совпал');
+    }
+
+    await this.writeCharacteristic(f001, await keyExchange.postBondConfig(), 'bond config', 'enc');
+    await delay(500);
+    await this.refreshPostBondNotifications();
+  }
+
+  async handleNotification(uuid: string, event: Event & { target: BluetoothRemoteGATTCharacteristic }): Promise<void> {
+    const value = event.target.value;
+    if (!value) {
+      this.log(formatTraceLine('RX', uuid, Uint8Array.of(), 'empty notify', 'raw'), 'warn');
+      return;
+    }
+
+    const raw = dataViewToBytes(value);
+    const packet: LinxPacket = { uuid, raw, plain: null };
+    this.log(formatTraceLine('RX', uuid, raw, notificationDescription(uuid, raw, this.authenticated), this.authenticated ? 'enc' : 'raw'));
+
+    if (uuid === CHAR_F002 && this.authenticated) {
+      try {
+        packet.plain = await this.requireKeyExchange().decrypt(raw);
+        packet.opcode = packet.plain[0];
+        this.log(formatTraceLine('RX', uuid, packet.plain, plainPacketDescription(uuid, packet.plain), 'plain'));
+        this.applyF002SensorInfo(packet);
+      } catch (error) {
+        this.log(`F002 decrypt: ${describeError(error)}`, 'warn');
+      }
+    } else if (uuid === CHAR_F003 && this.authenticated) {
+      try {
+        packet.plain = await this.requireKeyExchange().decrypt(raw);
+        this.log(formatTraceLine('RX', uuid, packet.plain, plainPacketDescription(uuid, packet.plain), 'plain'));
+        this.applyF003SensorInfo(packet.plain);
+      } catch (error) {
+        this.log(`F003 decrypt: ${describeError(error)}`, 'warn');
+      }
+    }
+
+    this.resolveWaiters(packet);
+  }
+
+  applyF002SensorInfo(packet: LinxPacket): void {
+    if (!packet?.plain?.length) return;
+
+    if (packet.opcode === OPCODES.GET_STARTUP_DEVICE_INFO) {
+      const parsed = parseStartupDeviceInfoResponse(packet.plain);
+      if (!parsed) return;
+      this.updateSensorInfo({
+        firmwareVersion: parsed.firmwareVersion,
+        hardwareVersion: parsed.hardwareVersion,
+        modelName: parsed.modelName,
+        wearDays: parsed.wearDays,
+      });
+      this.log(`PARSE F002 0x10: model=${parsed.modelName} fw=${parsed.firmwareVersion} hw=${parsed.hardwareVersion} wearDays=${parsed.wearDays}`);
+      return;
+    }
+
+    if (packet.opcode === OPCODES.GET_LOCAL_START_TIME) {
+      const parsed = parseLocalStartTimeResponse(packet.plain);
+      if (!parsed) return;
+      if (!parsed.isStarted) {
+        this.updateSensorInfo({
+          notStarted: true,
+          startTimeMs: null,
+          startTimeEstimated: false,
+          startTimeSource: '0x21',
+        });
+        this.log('PARSE F002 0x21: started=false', 'warn');
+        return;
+      }
+      if (parsed.utcMs === null) {
+        return;
+      }
+
+      this.updateSensorInfo({
+        notStarted: false,
+        startTimeMs: parsed.utcMs,
+        startTimeEstimated: false,
+        startTimeSource: '0x21',
+      });
+      this.log(`PARSE F002 0x21: startUtc=${new Date(parsed.utcMs).toISOString()} tzQ=${parsed.tzQuarters} dstQ=${parsed.dstQuarters}`);
+    }
+  }
+
+  applyF003SensorInfo(plain: ByteInput): void {
+    const status = parseF003StatusFrame(plain);
+    if (status) {
+      this.updateSensorInfo({
+        batteryMillivolts: status.millivolts,
+        batteryUpdatedAtMs: Date.now(),
+      });
+      this.log(`PARSE F003 status: batteryMv=${status.millivolts}`);
+      return;
+    }
+
+    const dataFrame = parseF003DataFrame(plain);
+    if (!dataFrame) return;
+
+    const patch: Partial<SensorInfo> = {
+      ageMinutes: dataFrame.timeOffsetMinutes,
+      lastFrameAtMs: Date.now(),
+    };
+
+    if (!this.sensorInfo.startTimeMs && dataFrame.timeOffsetMinutes >= 0) {
+      patch.startTimeMs = Date.now() - dataFrame.timeOffsetMinutes * 60_000;
+      patch.startTimeEstimated = true;
+      patch.startTimeSource = 'F003';
+    }
+
+    this.updateSensorInfo(patch);
+    this.log(`PARSE F003 data: ageMin=${dataFrame.timeOffsetMinutes} glucose=${dataFrame.glucoseMgDl} valid=${dataFrame.isValid}`);
+  }
+
+  waitForF002Opcode(opcode: number, timeoutMs: number): Promise<LinxPacket> {
+    return this.waitForPacket(
+      (packet) => packet.uuid === CHAR_F002 && packet.plain?.[0] === opcode,
+      timeoutMs,
+    );
+  }
+
+  waitForPacket(predicate: (packet: LinxPacket) => boolean, timeoutMs: number): Promise<LinxPacket> {
+    return new Promise((resolve, reject) => {
+      const waiter: PacketWaiter = {
+        predicate,
+        resolve,
+        reject,
+        timer: setTimeout(() => undefined, 0),
+      };
+      clearTimeout(waiter.timer);
+      waiter.timer = setTimeout(() => {
+        this.waiters.delete(waiter);
+        reject(new Error('Таймаут ожидания ответа сенсора'));
+      }, timeoutMs);
+      this.waiters.add(waiter);
+    });
+  }
+
+  resolveWaiters(packet: LinxPacket): void {
+    for (const waiter of Array.from(this.waiters)) {
+      if (waiter.predicate(packet)) {
+        clearTimeout(waiter.timer);
+        this.waiters.delete(waiter);
+        waiter.resolve(packet);
+      }
+    }
+  }
+
+  rejectWaiters(error: Error): void {
+    for (const waiter of this.waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.waiters.clear();
+  }
+
+  assertBluetoothSupport(): Bluetooth {
+    if (!navigator.bluetooth) {
+      throw new Error('Web Bluetooth не поддерживается этим браузером');
+    }
+    return navigator.bluetooth;
+  }
+
+  log(message: string, level: LogLevel = 'info'): void {
+    this.dispatchEvent(new CustomEvent('log', { detail: { message, level, time: new Date() } }));
+  }
+
+  updateSensorInfo(patch: Partial<SensorInfo>): void {
+    this.sensorInfo = {
+      ...this.sensorInfo,
+      ...patch,
+      name: patch.name || this.sensorInfo.name || this.device?.name || 'Без имени',
+      serial: patch.serial || this.sensorInfo.serial || this.serial,
+      updatedAtMs: Date.now(),
+    };
+    this.emitSensorInfo();
+  }
+
+  emitSensorInfo(): void {
+    this.dispatchEvent(new CustomEvent('sensorinfo', { detail: { info: { ...this.sensorInfo } } }));
+  }
+
+  requireServer(): BluetoothRemoteGATTServer {
+    if (!this.server) {
+      throw new Error('GATT server не подключен');
+    }
+    return this.server;
+  }
+
+  requireCharacteristic(uuid: string): BluetoothRemoteGATTCharacteristic {
+    const characteristic = this.characteristics.get(uuid);
+    if (!characteristic) {
+      throw new Error(`Characteristic ${shortUuid(uuid)} не найден`);
+    }
+    return characteristic;
+  }
+
+  requireKeyExchange(): AiDexKeyExchange {
+    if (!this.keyExchange) {
+      throw new Error('Обмен ключами не инициализирован');
+    }
+    return this.keyExchange;
+  }
+
+  requireCommandBuilder(): AiDexCommandBuilder {
+    if (!this.commandBuilder) {
+      throw new Error('Команды сенсора не инициализированы');
+    }
+    return this.commandBuilder;
+  }
+}
+
+export function bluetoothCapabilities(): BluetoothCapabilities {
+  return {
+    bluetooth: Boolean(navigator.bluetooth),
+    leScan: Boolean(navigator.bluetooth && 'requestLEScan' in navigator.bluetooth),
+    secureContext: window.isSecureContext,
+  };
+}
+
+export function deviceRecordFromBluetoothDevice(device: BluetoothDevice, source: DeviceSource = 'chooser'): DeviceRecord {
+  return {
+    id: device.id,
+    device,
+    name: device.name || 'Без имени',
+    source,
+    serial: extractSerialFromName(device.name || ''),
+    modelName: inferDeviceModelFromName(device.name || ''),
+    trusted: isKnownDeviceName(device.name),
+  };
+}
+
+export { DEVICE_NAME_PREFIXES };
+
+function emptySensorInfo(): SensorInfo {
+  return {
+    name: '',
+    serial: '',
+    modelName: '',
+    firmwareVersion: '',
+    hardwareVersion: '',
+    wearDays: 15,
+    startTimeMs: null,
+    startTimeEstimated: false,
+    startTimeSource: '',
+    notStarted: false,
+    batteryMillivolts: null,
+    batteryUpdatedAtMs: null,
+    ageMinutes: null,
+    selectedAtMs: null,
+    updatedAtMs: null,
+    lastFrameAtMs: null,
+  };
+}
+
+function dataViewToBytes(view: DataView): Uint8Array {
+  return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+}
+
+function requirePlainPacket(packet: LinxPacket): Uint8Array {
+  if (!packet.plain) {
+    throw new Error('Ответ сенсора не расшифрован');
+  }
+  return packet.plain;
+}
+
+function formatTraceLine(
+  direction: TraceDirection,
+  uuid: string,
+  bytes: ByteInput,
+  description: string | null,
+  encoding: TraceEncoding,
+): string {
+  const suffix = description ? ` (${description})` : '';
+  return `${direction} ${shortUuid(uuid)} ${encoding}: ${formatTraceBytes(bytesFromInput(bytes))}${suffix}`;
+}
+
+function formatControlLine(direction: TraceDirection, uuid: string, action: TraceEncoding, description: string): string {
+  return `${direction} ${shortUuid(uuid)} ${action} (${description})`;
+}
+
+function formatStatusLine(direction: TraceDirection, uuid: string, opcode: number, status: number): string {
+  const description = opcodeDescription(opcode);
+  const suffix = description ? ` (${description})` : '';
+  return `${direction} ${shortUuid(uuid)} ack: opcode=${opcodeHex(opcode)} status=${opcodeHex(status)}${suffix}`;
+}
+
+function formatTraceBytes(bytes: Uint8Array, maxBytes = 96): string {
+  if (bytes.length === 0) {
+    return '[0B]';
+  }
+
+  const shown = bytes.length > maxBytes ? bytes.slice(0, maxBytes) : bytes;
+  const truncated = bytes.length > maxBytes ? ' ...' : '';
+  return `${bytesToHex(shown)}${truncated} [${bytes.length}B]`;
+}
+
+function bytesFromInput(input: ByteInput): Uint8Array {
+  if (input instanceof Uint8Array) {
+    return Uint8Array.from(input);
+  }
+  if (input instanceof ArrayBuffer) {
+    return new Uint8Array(input);
+  }
+  if (ArrayBuffer.isView(input)) {
+    const view = input as ArrayBufferView;
+    return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+  }
+  return Uint8Array.from(input);
+}
+
+function notificationDescription(uuid: string, bytes: Uint8Array, authenticated: boolean): string | null {
+  if (sameBluetoothUuid(uuid, CHAR_F001) && bytes.length >= 16) {
+    return 'ключ пары';
+  }
+
+  if (authenticated && sameBluetoothUuid(uuid, CHAR_F002)) {
+    return 'encrypted data';
+  }
+  if (authenticated && sameBluetoothUuid(uuid, CHAR_F003)) {
+    return 'encrypted stream';
+  }
+
+  return 'raw notify';
+}
+
+function plainPacketDescription(uuid: string, bytes: Uint8Array): string | null {
+  if (sameBluetoothUuid(uuid, CHAR_F002) && bytes.length > 0) {
+    return opcodeDescription(bytes[0]);
+  }
+
+  if (sameBluetoothUuid(uuid, CHAR_F003)) {
+    if (parseF003StatusFrame(bytes)) {
+      return 'статус батареи';
+    }
+    if (parseF003DataFrame(bytes)) {
+      return 'данные CGM';
+    }
+  }
+
+  if (sameBluetoothUuid(uuid, CHAR_F001) && bytes.length >= 16) {
+    return 'ключ пары';
+  }
+
+  return null;
+}
+
+function opcodeDescription(opcode: number): string | null {
+  switch (opcode) {
+    case OPCODES.GET_STARTUP_DEVICE_INFO:
+      return 'инфо устройства';
+    case OPCODES.GET_BROADCAST_DATA:
+      return 'broadcast data';
+    case OPCODES.GET_LOCAL_START_TIME:
+      return 'время старта';
+    case OPCODES.SET_AUTO_UPDATE_STATUS:
+      return 'auto update';
+    case OPCODES.CLEAR_STORAGE:
+      return 'очистка памяти';
+    case OPCODES.RESET:
+      return 'сброс сенсора';
+    default:
+      return null;
+  }
+}
+
+function opcodeHex(opcode: number): string {
+  return `0x${(opcode & 0xff).toString(16).padStart(2, '0').toUpperCase()}`;
+}
+
+async function writeRawCharacteristic(
+  characteristic: BluetoothRemoteGATTCharacteristic,
+  bytes: ByteInput,
+): Promise<CharacteristicWriteMethodName> {
+  const payload = toWritePayload(bytes);
+  const attempts = [
+    ['writeValue', characteristic.writeValue?.bind(characteristic)],
+    ['writeValueWithResponse', characteristic.writeValueWithResponse?.bind(characteristic)],
+    ['writeValueWithoutResponse', characteristic.writeValueWithoutResponse?.bind(characteristic)],
+  ].filter((entry): entry is [CharacteristicWriteMethodName, CharacteristicWriteMethod] => typeof entry[1] === 'function');
+
+  if (attempts.length === 0) {
+    throw new Error('Characteristic не поддерживает методы записи');
+  }
+
+  let lastError: unknown;
+  for (const [name, method] of attempts) {
+    try {
+      await method.call(characteristic, payload);
+      return name;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw normalizeError(lastError, `BLE write failed (${attempts.map(([name]) => name).join(', ')})`);
+}
+
+function toWritePayload(bytes: ByteInput): BufferSource {
+  if (bytes instanceof ArrayBuffer) {
+    return bytes;
+  }
+  if (ArrayBuffer.isView(bytes)) {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  }
+  return Uint8Array.from(bytes);
+}
+
+async function withGattRetry<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= GATT_BUSY_RETRIES; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isGattBusyError(error) || attempt === GATT_BUSY_RETRIES) {
+        throw error;
+      }
+      await delay(GATT_BUSY_DELAY_MS * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shortUuid(uuid: string): string {
+  return uuid.slice(4, 8).toUpperCase();
+}
+
+function sameBluetoothUuid(left: string, right: string): boolean {
+  return normalizeBluetoothUuid(left) === normalizeBluetoothUuid(right);
+}
+
+function normalizeBluetoothUuid(uuid: string): string {
+  const value = String(uuid || '').toLowerCase();
+  if (/^[0-9a-f]{4}$/.test(value)) {
+    return `0000${value}-0000-1000-8000-00805f9b34fb`;
+  }
+  if (/^[0-9a-f]{8}$/.test(value)) {
+    return `${value}-0000-1000-8000-00805f9b34fb`;
+  }
+  return value;
+}
+
+function describeStage(stage: ConnectionStage): string {
+  switch (stage) {
+    case 'connect':
+      return 'GATT connect';
+    case 'services':
+      return 'service discovery';
+    case 'characteristics':
+      return 'characteristics';
+    case 'cccd':
+      return 'CCCD';
+    case 'key-exchange':
+      return 'key exchange';
+    default:
+      return stage;
+  }
+}
+
+function markGattStageError(error: unknown, stage: string, isF001Cccd: boolean): void {
+  if (error && typeof error === 'object') {
+    const gattError = error as Partial<LinxGattError>;
+    gattError.linxStage = stage;
+    gattError.linxF001Cccd = Boolean(isF001Cccd);
+  }
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.name && error.name !== 'Error' ? `${error.name}: ${error.message}` : error.message;
+  }
+  if (typeof error === 'string' && error) {
+    return error;
+  }
+  if (error && typeof error === 'object') {
+    const record = error as { name?: unknown; message?: unknown; code?: unknown };
+    const parts: string[] = [];
+    if (record.name) parts.push(String(record.name));
+    if (record.message) parts.push(String(record.message));
+    if (record.code) parts.push(`code=${String(record.code)}`);
+    if (parts.length > 0) return parts.join(': ');
+    try {
+      const json = JSON.stringify(error);
+      if (json && json !== '{}') return json;
+    } catch (_jsonError) {
+      // Fall through to generic message.
+    }
+  }
+  return 'неизвестная ошибка без сообщения';
+}
+
+function normalizeError(error: unknown, fallback: string): Error {
+  const message = describeError(error);
+  if (message === 'неизвестная ошибка без сообщения') {
+    return new Error(fallback);
+  }
+  return new Error(`${fallback}: ${message}`);
+}
+
+function isAuthenticationError(error: unknown): boolean {
+  const text = errorSearchText(error);
+  return text.includes('auth') || text.includes('security') || text.includes('encrypt');
+}
+
+function isGattBusyError(error: unknown): boolean {
+  const text = errorSearchText(error);
+  return text.includes('already in progress') ||
+    text.includes('operation in progress') ||
+    text.includes('gatt operation') ||
+    text.includes('busy');
+}
+
+function isGattDisconnectedError(error: unknown): boolean {
+  const text = errorSearchText(error);
+  return text.includes('gatt server is disconnected') ||
+    text.includes('server is disconnected') ||
+    text.includes('disconnected') ||
+    text.includes('отключ') ||
+    text.includes('networkerror');
+}
+
+function isUnknownCgmServiceError(error: unknown): boolean {
+  const text = errorSearchText(error);
+  const mentionsCgm = text.includes('cgm') ||
+    text.includes('continuous glucose monitoring') ||
+    text.includes('181f') ||
+    text.includes('0x181f') ||
+    text.includes(SERVICE_F000);
+  return mentionsCgm &&
+    (text.includes('unknown service') || text.includes('unknown service name'));
+}
+
+function errorSearchText(error: unknown): string {
+  if (typeof error === 'string') {
+    return error.toLowerCase();
+  }
+  if (!error || typeof error !== 'object') {
+    return '';
+  }
+
+  const record = error as { name?: unknown; message?: unknown };
+  return `${String(record.name || '')} ${String(record.message || '')}`.toLowerCase();
+}

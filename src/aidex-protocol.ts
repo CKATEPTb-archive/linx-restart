@@ -23,6 +23,13 @@ export interface LocalStartTime {
   utcMs: number | null;
 }
 
+export type ResetFlow = 'legacy-reset' | 'clear-storage-activation';
+
+export interface AiDexActivationTimeZone {
+  tzQuarters: number;
+  dstQuarters: number;
+}
+
 export interface F003DataFrame {
   opcode: number;
   timeOffsetMinutes: number;
@@ -54,12 +61,15 @@ export const OPCODES = Object.freeze({
   GET_STARTUP_DEVICE_INFO: 0x10,
   POST_BOND_CONFIG: 0x10,
   GET_BROADCAST_DATA: 0x11,
+  SET_NEW_SENSOR: 0x20,
   GET_LOCAL_START_TIME: 0x21,
   GET_START_TIME: 0x21,
   SET_AUTO_UPDATE_STATUS: 0x34,
   CLEAR_STORAGE: 0xf3,
   RESET: 0xf0,
 });
+
+const CLEAR_STORAGE_ACTIVATION_MIN_FIRMWARE = [1, 8, 3] as const;
 
 export const DEVICE_NAME_PREFIXES = [
   'LinX Vista',
@@ -197,6 +207,58 @@ export function makeCommand(opcode: number, params: number[] = []): Uint8Array {
   command[command.length - 2] = crc & 0xff;
   command[command.length - 1] = (crc >> 8) & 0xff;
   return command;
+}
+
+export function resetFlowForFirmware(version: string): ResetFlow {
+  if (!version || compareFirmwareVersion(version, CLEAR_STORAGE_ACTIVATION_MIN_FIRMWARE) < 0) {
+    return 'legacy-reset';
+  }
+
+  return 'clear-storage-activation';
+}
+
+export function compareFirmwareVersion(version: string, baseline: readonly number[]): number {
+  const current = parseFirmwareVersion(version);
+  const length = Math.max(current.length, baseline.length);
+
+  for (let index = 0; index < length; index += 1) {
+    const left = current[index] ?? 0;
+    const right = baseline[index] ?? 0;
+    if (left !== right) {
+      return left > right ? 1 : -1;
+    }
+  }
+
+  return 0;
+}
+
+export function setNewSensorParams(date = new Date()): number[] {
+  const { tzQuarters, dstQuarters } = aiDexActivationTimeZone(date);
+  const year = date.getFullYear();
+  return [
+    year & 0xff,
+    (year >> 8) & 0xff,
+    date.getMonth() + 1,
+    date.getDate(),
+    date.getHours(),
+    date.getMinutes(),
+    date.getSeconds(),
+    tzQuarters,
+    dstQuarters,
+  ];
+}
+
+export function aiDexActivationTimeZone(date = new Date()): AiDexActivationTimeZone {
+  const currentOffsetMinutes = -date.getTimezoneOffset();
+  const januaryOffsetMinutes = -new Date(date.getFullYear(), 0, 1).getTimezoneOffset();
+  const julyOffsetMinutes = -new Date(date.getFullYear(), 6, 1).getTimezoneOffset();
+  const rawOffsetMinutes = Math.min(januaryOffsetMinutes, julyOffsetMinutes);
+  const dstOffsetMinutes = Math.max(0, currentOffsetMinutes - rawOffsetMinutes);
+
+  return {
+    tzQuarters: Math.trunc(rawOffsetMinutes / 15),
+    dstQuarters: Math.trunc(dstOffsetMinutes / 15),
+  };
 }
 
 export function validateCrc16(data: Uint8Array): boolean {
@@ -397,6 +459,10 @@ export class AiDexCommandBuilder {
   reset(): Promise<Uint8Array> {
     return this.encrypted(OPCODES.RESET);
   }
+
+  setNewSensor(date = new Date()): Promise<Uint8Array> {
+    return this.encrypted(OPCODES.SET_NEW_SENSOR, setNewSensorParams(date));
+  }
 }
 
 export async function aesCfb128Encrypt(plaintext: ByteInput, key: Uint8Array, iv: Uint8Array): Promise<Uint8Array> {
@@ -444,6 +510,14 @@ async function aesEcbEncryptBlock(block: Uint8Array, key: Uint8Array): Promise<U
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseFirmwareVersion(version: string): number[] {
+  return version
+    .trim()
+    .split('.')
+    .map((part) => Number.parseInt(part, 10))
+    .filter((part) => Number.isFinite(part));
 }
 
 function responsePayloadCandidates(data: ByteInput): Uint8Array[] {

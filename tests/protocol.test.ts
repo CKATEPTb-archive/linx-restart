@@ -14,6 +14,8 @@ import {
   parseF003StatusFrame,
   parseLocalStartTimeResponse,
   parseStartupDeviceInfoResponse,
+  resetFlowForFirmware,
+  setNewSensorParams,
   validateCrc16,
 } from '../src/aidex-protocol';
 import { md5 } from '../src/md5';
@@ -41,6 +43,7 @@ assert.equal(bytesToHex(makeCommand(0xf0)), 'F0 EF 0E');
 assert.equal(bytesToHex(makeCommand(0xf3)), 'F3 8C 3E');
 assert.equal(bytesToHex(makeCommand(0x11)), '11 E0 E3');
 assert.equal(bytesToHex(makeCommand(0x21)), '21 B3 D5');
+assert.equal(bytesToHex(makeCommand(0x20, [0xe8, 0x07, 6, 16, 18, 30, 0, 8, 0])), '20 E8 07 06 10 12 1E 00 08 00 68 BA');
 
 const startupInfo = parseStartupDeviceInfoResponse(Uint8Array.of(
   0x10, 0x00,
@@ -135,5 +138,14 @@ const desktopPlatform = detectPlatform({
 });
 assert.equal(supportDetails(noBluetoothCapabilities, desktopPlatform).recommendation, null);
 assert.equal(supportDetails({ ...noBluetoothCapabilities, bluetooth: true }, androidPlatform).recommendation, null);
+assert.equal(resetFlowForFirmware(''), 'legacy-reset');
+assert.equal(resetFlowForFirmware('1.8.2'), 'legacy-reset');
+assert.equal(resetFlowForFirmware('1.8.3'), 'clear-storage-activation');
+assert.equal(resetFlowForFirmware('1.8.4'), 'clear-storage-activation');
+assert.equal(resetFlowForFirmware('1.9.0'), 'clear-storage-activation');
+
+const newSensorParams = setNewSensorParams(new Date(2024, 5, 16, 18, 30, 0));
+assert.deepEqual(newSensorParams.slice(0, 7), [0xe8, 0x07, 6, 16, 18, 30, 0]);
+assert.equal(newSensorParams.length, 9);
 
 console.log('protocol tests passed');

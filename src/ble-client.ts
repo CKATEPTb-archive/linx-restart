@@ -24,6 +24,7 @@ import {
   parseF003StatusFrame,
   parseLocalStartTimeResponse,
   parseStartupDeviceInfoResponse,
+  resetFlowForFirmware,
 } from './aidex-protocol';
 import type { ByteInput } from './aidex-protocol';
 
@@ -94,6 +95,7 @@ type DeviceSource = 'chooser' | 'manual' | 'scan';
 type ConnectionStage = 'connect' | 'services' | 'characteristics' | 'cccd' | 'key-exchange';
 type CharacteristicWriteMethodName = 'writeValue' | 'writeValueWithResponse' | 'writeValueWithoutResponse';
 type CharacteristicWriteMethod = (value: BufferSource) => Promise<void>;
+type CharacteristicWritePreference = 'default' | 'with-response-first' | 'without-response-first';
 type TraceDirection = 'TX' | 'RX';
 type TraceEncoding = 'raw' | 'enc' | 'plain' | 'read' | 'cccd';
 
@@ -102,8 +104,16 @@ interface ConnectionRetryPlan {
   message: string;
 }
 
+interface PairChallengeAttempt {
+  description: string;
+  timeoutMs: number;
+  writePreference: CharacteristicWritePreference;
+}
+
 const TIMEOUTS = Object.freeze({
   pairKey: 20_000,
+  pairKeyFirstAttempt: 8_000,
+  pairKeyRetry: 12_000,
   bond: 12_000,
   commandAck: 18_000,
   sensorInfo: 5_000,
@@ -119,6 +129,8 @@ const CONNECT_RETRIES = 2;
 const CONNECT_RETRY_DELAY_MS = 1_500;
 const F002_READ_FALLBACK_DELAY_MS = 350;
 const F002_READ_FALLBACK_INTERVAL_MS = 550;
+const CLEAR_STORAGE_QUIET_WINDOW_MS = 12_000;
+const POST_RESET_STALE_START_TOLERANCE_MS = 120_000;
 const CCCD_ORDER = [CHAR_F003, CHAR_F002, CHAR_F001];
 
 export class LinxBleClient extends EventTarget {
@@ -443,27 +455,33 @@ export class LinxBleClient extends EventTarget {
       throw new Error('Сначала выполните подключение и обмен ключами');
     }
 
-    const f002 = this.requireCharacteristic(CHAR_F002);
     const commandBuilder = this.requireCommandBuilder();
-    const clearAck = this.waitForF002OpcodeWithReadFallback(OPCODES.CLEAR_STORAGE, TIMEOUTS.commandAck);
-    await this.writeCharacteristic(f002, await commandBuilder.clearStorage(), opcodeDescription(OPCODES.CLEAR_STORAGE), 'enc');
-    const clearResponse = await clearAck;
-    const clearPlain = requirePlainPacket(clearResponse);
-    const clearStatus = clearPlain[1] ?? 0xff;
-    this.log(formatStatusLine('RX', CHAR_F002, OPCODES.CLEAR_STORAGE, clearStatus));
+    const flow = resetFlowForFirmware(this.sensorInfo.firmwareVersion);
+    const resetRequestedAtMs = Date.now();
+    const clearStatus = await this.sendF002CommandStatus(
+      OPCODES.CLEAR_STORAGE,
+      () => commandBuilder.clearStorage(),
+    );
 
     if (clearStatus !== 0x00) {
       throw new Error(`CLEAR_STORAGE вернул статус 0x${clearStatus.toString(16).padStart(2, '0')}`);
     }
 
-    const resetAck = this.waitForF002OpcodeWithReadFallback(OPCODES.RESET, TIMEOUTS.commandAck);
-    await this.writeCharacteristic(f002, await commandBuilder.reset(), opcodeDescription(OPCODES.RESET), 'enc');
+    if (flow === 'clear-storage-activation') {
+      return this.finishClearStorageActivationReset(resetRequestedAtMs);
+    }
+
+    return this.finishLegacyReset();
+  }
+
+  async finishLegacyReset(): Promise<{ confirmed: boolean }> {
+    const commandBuilder = this.requireCommandBuilder();
 
     try {
-      const resetResponse = await resetAck;
-      const resetPlain = requirePlainPacket(resetResponse);
-      const resetStatus = resetPlain[1] ?? 0xff;
-      this.log(formatStatusLine('RX', CHAR_F002, OPCODES.RESET, resetStatus));
+      const resetStatus = await this.sendF002CommandStatus(
+        OPCODES.RESET,
+        () => commandBuilder.reset(),
+      );
       if (resetStatus !== 0x00) {
         throw new Error(`RESET вернул статус 0x${resetStatus.toString(16).padStart(2, '0')}`);
       }
@@ -477,6 +495,76 @@ export class LinxBleClient extends EventTarget {
       }
       throw error;
     }
+  }
+
+  async finishClearStorageActivationReset(resetRequestedAtMs: number): Promise<{ confirmed: boolean }> {
+    await delay(CLEAR_STORAGE_QUIET_WINDOW_MS);
+    await this.reconnectAfterClearStorage();
+    const confirmed = await this.activatePostResetStartTimeIfNeeded(resetRequestedAtMs);
+    this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'reset' } }));
+    return { confirmed };
+  }
+
+  async reconnectAfterClearStorage(): Promise<void> {
+    this.closeGattSession();
+    await delay(GATT_SETTLE_DELAY_MS);
+    await this.connect(this.serial);
+  }
+
+  async activatePostResetStartTimeIfNeeded(resetRequestedAtMs: number): Promise<boolean> {
+    if (!this.shouldSetNewSensorAfterReset(resetRequestedAtMs)) {
+      return true;
+    }
+
+    const commandBuilder = this.requireCommandBuilder();
+    try {
+      const status = await this.sendF002CommandStatus(
+        OPCODES.SET_NEW_SENSOR,
+        () => commandBuilder.setNewSensor(),
+      );
+      if (status !== 0x00) {
+        throw new Error(`SET_NEW_SENSOR вернул статус 0x${status.toString(16).padStart(2, '0')}`);
+      }
+      await delay(1_000);
+      await this.requestOptionalF002Info(
+        OPCODES.GET_LOCAL_START_TIME,
+        () => this.requireCommandBuilder().getLocalStartTime(),
+        'время запуска после 0x20',
+      );
+      return true;
+    } catch (error) {
+      if (!this.connected) {
+        this.log('GATT disconnect after TX F002 0x20', 'warn');
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  shouldSetNewSensorAfterReset(resetRequestedAtMs: number): boolean {
+    const startTimeMs = this.sensorInfo.startTimeMs;
+    if (this.sensorInfo.notStarted || startTimeMs === null) {
+      return true;
+    }
+
+    return startTimeMs < resetRequestedAtMs - POST_RESET_STALE_START_TOLERANCE_MS;
+  }
+
+  async sendF002CommandStatus(
+    opcode: number,
+    buildCommand: F002CommandBuilder,
+    timeoutMs = TIMEOUTS.commandAck,
+  ): Promise<number> {
+    const f002 = this.requireCharacteristic(CHAR_F002);
+    const command = await buildCommand();
+    const responsePromise = this.waitForF002OpcodeWithReadFallback(opcode, timeoutMs);
+    responsePromise.catch(() => undefined);
+    await this.writeCharacteristic(f002, command, opcodeDescription(opcode), 'enc');
+    const response = await responsePromise;
+    const plain = requirePlainPacket(response);
+    const status = plain[1] ?? 0xff;
+    this.log(formatStatusLine('RX', CHAR_F002, opcode, status));
+    return status;
   }
 
   async requestSensorInfo(): Promise<void> {
@@ -670,9 +758,11 @@ export class LinxBleClient extends EventTarget {
     bytes: ByteInput,
     description: string | null = null,
     encoding: TraceEncoding = 'raw',
+    writePreference: CharacteristicWritePreference = 'default',
   ): Promise<void> {
     this.log(formatTraceLine('TX', characteristic.uuid, bytes, description, encoding));
-    await this.runGattOperation(() => writeRawCharacteristic(characteristic, bytes));
+    const methodName = await this.runGattOperation(() => writeRawCharacteristic(characteristic, bytes, writePreference));
+    this.log(`OK ${shortUuid(characteristic.uuid)} write (${methodName})`);
   }
 
   async runGattOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -715,14 +805,7 @@ export class LinxBleClient extends EventTarget {
     const f002 = this.requireCharacteristic(CHAR_F002);
     const keyExchange = this.requireKeyExchange();
 
-    const pairPromise = this.waitForPacket(
-      (packet) => packet.uuid === CHAR_F001 && packet.raw.length >= 16,
-      TIMEOUTS.pairKey,
-    );
-
-    await this.writeCharacteristic(f001, keyExchange.getChallenge(), 'pair challenge', 'raw');
-
-    const pairPacket = await pairPromise;
+    const pairPacket = await this.writePairChallenge(f001, keyExchange);
     keyExchange.setPairKey(pairPacket.raw);
 
     this.log(formatControlLine('TX', CHAR_F002, 'read', 'bond read'));
@@ -740,6 +823,45 @@ export class LinxBleClient extends EventTarget {
     await this.writeCharacteristic(f001, await keyExchange.postBondConfig(), 'bond config', 'enc');
     await delay(500);
     await this.refreshPostBondNotifications();
+  }
+
+  async writePairChallenge(
+    characteristic: BluetoothRemoteGATTCharacteristic,
+    keyExchange: AiDexKeyExchange,
+  ): Promise<LinxPacket> {
+    const challenge = keyExchange.getChallenge();
+    const attempts = pairChallengeAttempts();
+    let lastError: unknown;
+
+    for (let index = 0; index < attempts.length; index += 1) {
+      const attempt = attempts[index];
+      const pairPromise = this.waitForPacket(
+        (packet) => packet.uuid === CHAR_F001 && packet.raw.length >= 16,
+        attempt.timeoutMs,
+      );
+      pairPromise.catch(() => undefined);
+
+      try {
+        await this.writeCharacteristic(
+          characteristic,
+          challenge,
+          attempt.description,
+          'raw',
+          attempt.writePreference,
+        );
+        return await pairPromise;
+      } catch (error) {
+        lastError = error;
+        if (!this.connected || index === attempts.length - 1) {
+          throw error;
+        }
+
+        this.log(`F001 pair retry: ${describeError(error)}; switching write method`, 'warn');
+        await delay(GATT_SETTLE_DELAY_MS);
+      }
+    }
+
+    throw normalizeError(lastError, 'F001 pair challenge failed');
   }
 
   async handleNotification(uuid: string, event: Event & { target: BluetoothRemoteGATTCharacteristic }): Promise<void> {
@@ -1155,6 +1277,8 @@ function opcodeDescription(opcode: number): string | null {
       return 'инфо устройства';
     case OPCODES.GET_BROADCAST_DATA:
       return 'broadcast data';
+    case OPCODES.SET_NEW_SENSOR:
+      return 'новый запуск';
     case OPCODES.GET_LOCAL_START_TIME:
       return 'время старта';
     case OPCODES.SET_AUTO_UPDATE_STATUS:
@@ -1175,23 +1299,19 @@ function opcodeHex(opcode: number): string {
 async function writeRawCharacteristic(
   characteristic: BluetoothRemoteGATTCharacteristic,
   bytes: ByteInput,
+  writePreference: CharacteristicWritePreference = 'default',
 ): Promise<CharacteristicWriteMethodName> {
   const payload = toWritePayload(bytes);
   const writeValue = characteristic.writeValue?.bind(characteristic);
   const writeWithResponse = characteristic.writeValueWithResponse?.bind(characteristic);
   const writeWithoutResponse = characteristic.writeValueWithoutResponse?.bind(characteristic);
-  const rawAttempts: Array<[CharacteristicWriteMethodName, CharacteristicWriteMethod | undefined]> =
-    sameBluetoothUuid(characteristic.uuid, CHAR_F002)
-      ? [
-        ['writeValueWithoutResponse', writeWithoutResponse],
-        ['writeValueWithResponse', writeWithResponse],
-        ['writeValue', writeValue],
-      ]
-      : [
-        ['writeValue', writeValue],
-        ['writeValueWithResponse', writeWithResponse],
-        ['writeValueWithoutResponse', writeWithoutResponse],
-      ];
+  const rawAttempts = writeAttempts(
+    characteristic.uuid,
+    writePreference,
+    writeValue,
+    writeWithResponse,
+    writeWithoutResponse,
+  );
   const attempts = rawAttempts
     .filter((entry): entry is [CharacteristicWriteMethodName, CharacteristicWriteMethod] => typeof entry[1] === 'function');
 
@@ -1210,6 +1330,44 @@ async function writeRawCharacteristic(
   }
 
   throw normalizeError(lastError, `BLE write failed (${attempts.map(([name]) => name).join(', ')})`);
+}
+
+function writeAttempts(
+  uuid: string,
+  writePreference: CharacteristicWritePreference,
+  writeValue: CharacteristicWriteMethod | undefined,
+  writeWithResponse: CharacteristicWriteMethod | undefined,
+  writeWithoutResponse: CharacteristicWriteMethod | undefined,
+): Array<[CharacteristicWriteMethodName, CharacteristicWriteMethod | undefined]> {
+  if (writePreference === 'without-response-first') {
+    return [
+      ['writeValueWithoutResponse', writeWithoutResponse],
+      ['writeValueWithResponse', writeWithResponse],
+      ['writeValue', writeValue],
+    ];
+  }
+
+  if (writePreference === 'with-response-first') {
+    return [
+      ['writeValueWithResponse', writeWithResponse],
+      ['writeValue', writeValue],
+      ['writeValueWithoutResponse', writeWithoutResponse],
+    ];
+  }
+
+  if (sameBluetoothUuid(uuid, CHAR_F002)) {
+    return [
+      ['writeValueWithoutResponse', writeWithoutResponse],
+      ['writeValueWithResponse', writeWithResponse],
+      ['writeValue', writeValue],
+    ];
+  }
+
+  return [
+    ['writeValue', writeValue],
+    ['writeValueWithResponse', writeWithResponse],
+    ['writeValueWithoutResponse', writeWithoutResponse],
+  ];
 }
 
 function toWritePayload(bytes: ByteInput): BufferSource {
@@ -1301,6 +1459,31 @@ function connectionRetryPlan(error: unknown, stage: ConnectionStage, attempt: nu
 
 function isF001CccdError(error: unknown): boolean {
   return Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
+}
+
+function pairChallengeAttempts(): PairChallengeAttempt[] {
+  if (!isAndroidRuntime()) {
+    return [
+      {
+        description: 'pair challenge',
+        timeoutMs: TIMEOUTS.pairKey,
+        writePreference: 'default',
+      },
+    ];
+  }
+
+  return [
+    {
+      description: 'pair challenge',
+      timeoutMs: TIMEOUTS.pairKeyFirstAttempt,
+      writePreference: 'with-response-first',
+    },
+    {
+      description: 'pair challenge retry no-response',
+      timeoutMs: TIMEOUTS.pairKeyRetry,
+      writePreference: 'without-response-first',
+    },
+  ];
 }
 
 function authCccdSettleDelayMs(): number {

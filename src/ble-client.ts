@@ -108,6 +108,7 @@ interface PairChallengeAttempt {
   description: string;
   timeoutMs: number;
   writePreference: CharacteristicWritePreference;
+  challenge?: Uint8Array;
 }
 
 const TIMEOUTS = Object.freeze({
@@ -136,6 +137,10 @@ const F002_READ_FALLBACK_INTERVAL_MS = 550;
 const CLEAR_STORAGE_QUIET_WINDOW_MS = 12_000;
 const POST_RESET_STALE_START_TOLERANCE_MS = 120_000;
 const CCCD_ORDER = [CHAR_F003, CHAR_F002, CHAR_F001];
+const OFFICIAL_PAIRED_F001_CHALLENGE = Uint8Array.of(
+  0x91, 0xc5, 0x47, 0x02, 0x80, 0xbb, 0x4c, 0x3d,
+  0x8f, 0xa8, 0xed, 0xb1, 0xb0, 0x6a, 0x0f, 0x06,
+);
 
 export class LinxBleClient extends EventTarget {
   device: BluetoothDevice | null;
@@ -950,9 +955,10 @@ export class LinxBleClient extends EventTarget {
       pairPromise.catch(() => undefined);
 
       try {
+        const challengeBytes = attempt.challenge ?? challenge;
         await this.writeCharacteristic(
           characteristic,
-          challenge,
+          challengeBytes,
           attempt.description,
           'raw',
           attempt.writePreference,
@@ -964,7 +970,8 @@ export class LinxBleClient extends EventTarget {
           throw error;
         }
 
-        this.log(`F001 pair retry: ${describeError(error)}; switching write method`, 'warn');
+        const nextAttempt = attempts[index + 1]?.description || 'none';
+        this.log(`F001 pair retry: ${describeError(error)}; next=${nextAttempt}`, 'warn');
         await delay(GATT_SETTLE_DELAY_MS);
       }
     }
@@ -1513,7 +1520,9 @@ function delay(ms: number): Promise<void> {
 }
 
 function shortUuid(uuid: string): string {
-  return uuid.slice(4, 8).toUpperCase();
+  const normalized = normalizeBluetoothUuid(uuid);
+  const bluetoothBaseMatch = normalized.match(/^0000([0-9a-f]{4})-/i);
+  return (bluetoothBaseMatch?.[1] || String(uuid || '?')).toUpperCase();
 }
 
 function characteristicPropertiesDescription(characteristic: BluetoothRemoteGATTCharacteristic): string {
@@ -1619,8 +1628,14 @@ function pairChallengeAttempts(): PairChallengeAttempt[] {
     return [
       {
         description: 'pair challenge',
-        timeoutMs: TIMEOUTS.pairKey,
+        timeoutMs: TIMEOUTS.pairKeyRetry,
         writePreference: 'default',
+      },
+      {
+        description: 'pair challenge official wake',
+        timeoutMs: TIMEOUTS.pairKeyFirstAttempt,
+        writePreference: 'without-response-first',
+        challenge: OFFICIAL_PAIRED_F001_CHALLENGE,
       },
     ];
   }
@@ -1635,6 +1650,12 @@ function pairChallengeAttempts(): PairChallengeAttempt[] {
       description: 'pair challenge retry with-response',
       timeoutMs: TIMEOUTS.pairKeyFirstAttempt,
       writePreference: 'with-response-first',
+    },
+    {
+      description: 'pair challenge official wake',
+      timeoutMs: TIMEOUTS.pairKeyFirstAttempt,
+      writePreference: 'without-response-first',
+      challenge: OFFICIAL_PAIRED_F001_CHALLENGE,
     },
   ];
 }

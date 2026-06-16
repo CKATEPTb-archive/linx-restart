@@ -10,6 +10,7 @@ import {
   isKnownDeviceName,
   makeCommand,
   normalizeSerial,
+  OPCODES,
   parseF003DataFrame,
   parseF003StatusFrame,
   parseLocalStartTimeResponse,
@@ -43,6 +44,8 @@ assert.equal(bytesToHex(makeCommand(0xf0)), 'F0 EF 0E');
 assert.equal(bytesToHex(makeCommand(0xf3)), 'F3 8C 3E');
 assert.equal(bytesToHex(makeCommand(0x11)), '11 E0 E3');
 assert.equal(bytesToHex(makeCommand(0x21)), '21 B3 D5');
+assert.equal(bytesToHex(makeCommand(OPCODES.SET_AUTO_UPDATE_STATUS, [1])), '34 01 7F C4');
+assert.equal(bytesToHex(makeCommand(OPCODES.SET_DYNAMIC_ADV_MODE, [1])), '35 01 4E F7');
 assert.equal(bytesToHex(makeCommand(0x20, [0xe8, 0x07, 6, 16, 18, 30, 0, 8, 0])), '20 E8 07 06 10 12 1E 00 08 00 68 BA');
 
 const startupInfo = parseStartupDeviceInfoResponse(Uint8Array.of(

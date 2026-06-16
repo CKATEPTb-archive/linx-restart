@@ -383,6 +383,7 @@ export class LinxBleClient extends EventTarget {
         this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'key' } }));
         this.log('KEY session: ready');
         await this.requestSensorInfo();
+        await this.startConnectedBroadcastMode();
         return;
       } catch (error) {
         const isF001CccdFailure = Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
@@ -588,6 +589,29 @@ export class LinxBleClient extends EventTarget {
     await this.requestDeviceInformation();
   }
 
+  async startConnectedBroadcastMode(): Promise<void> {
+    if (!this.authenticated) {
+      return;
+    }
+
+    const commandBuilder = this.requireCommandBuilder();
+    await this.requestOptionalF002Info(
+      OPCODES.SET_DYNAMIC_ADV_MODE,
+      () => commandBuilder.setDynamicAdvMode(1),
+      'dynamic adv 0x35',
+    );
+    await this.requestOptionalF002Info(
+      OPCODES.SET_AUTO_UPDATE_STATUS,
+      () => commandBuilder.setAutoUpdateStatus(true),
+      'auto update 0x34',
+    );
+    await this.requestOptionalF002Info(
+      OPCODES.GET_BROADCAST_DATA,
+      () => commandBuilder.getBroadcastData(),
+      'broadcast data 0x11',
+    );
+  }
+
   async requestOptionalF002Info(opcode: number, buildCommand: F002CommandBuilder, label: string): Promise<void> {
     try {
       const f002 = this.requireCharacteristic(CHAR_F002);
@@ -596,7 +620,7 @@ export class LinxBleClient extends EventTarget {
       const response = await responsePromise;
       this.applyF002SensorInfo(response);
     } catch (error) {
-      this.log(`Не удалось получить ${label}: ${describeError(error)}`, 'warn');
+      this.log(`ERR F002 ${opcodeHex(opcode)} (${label}): ${describeError(error)}`, 'warn');
     }
   }
 
@@ -729,6 +753,7 @@ export class LinxBleClient extends EventTarget {
         await this.startNotifications(characteristic, uuid);
       } catch (error) {
         markGattStageError(error, `cccd:${shortUuid(uuid)}`, uuid === CHAR_F001);
+        this.log(`ERR ${shortUuid(uuid)} cccd: ${describeError(error)}`, 'error');
         throw error;
       }
       await delay(uuid === CHAR_F001 ? authCccdSettleDelayMs() : GATT_SETTLE_DELAY_MS);
@@ -1283,6 +1308,8 @@ function opcodeDescription(opcode: number): string | null {
       return 'время старта';
     case OPCODES.SET_AUTO_UPDATE_STATUS:
       return 'auto update';
+    case OPCODES.SET_DYNAMIC_ADV_MODE:
+      return 'dynamic adv';
     case OPCODES.CLEAR_STORAGE:
       return 'очистка памяти';
     case OPCODES.RESET:

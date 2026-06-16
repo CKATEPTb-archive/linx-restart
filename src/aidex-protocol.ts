@@ -65,6 +65,7 @@ export const OPCODES = Object.freeze({
   GET_LOCAL_START_TIME: 0x21,
   GET_START_TIME: 0x21,
   SET_AUTO_UPDATE_STATUS: 0x34,
+  SET_DYNAMIC_ADV_MODE: 0x35,
   CLEAR_STORAGE: 0xf3,
   RESET: 0xf0,
 });
@@ -450,6 +451,10 @@ export class AiDexCommandBuilder {
 
   setAutoUpdateStatus(enabled = true): Promise<Uint8Array> {
     return this.encrypted(OPCODES.SET_AUTO_UPDATE_STATUS, [enabled ? 1 : 0]);
+  }
+
+  setDynamicAdvMode(mode = 1): Promise<Uint8Array> {
+    return this.encrypted(OPCODES.SET_DYNAMIC_ADV_MODE, [mode]);
   }
 
   clearStorage(): Promise<Uint8Array> {

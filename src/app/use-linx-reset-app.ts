@@ -226,5 +226,5 @@ export function useLinxResetApp(): LinxResetViewModel {
 }
 
 function isExchangeLog(message: string): boolean {
-  return /^(TX|RX)\s/.test(message);
+  return /^(TX|RX|OK|ERR|GATT|KEY|CCCD|DIS|F00[123]|F001\/bonding|Primary services|PARSE)\b/.test(message);
 }

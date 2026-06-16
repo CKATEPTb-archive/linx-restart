@@ -2,6 +2,10 @@ import {
   AiDexCommandBuilder,
   AiDexKeyExchange,
   CHAR_DIS_FIRMWARE_REVISION,
+  CHAR_DIS_MANUFACTURER_NAME,
+  CHAR_DIS_MODEL_NUMBER,
+  CHAR_DIS_SERIAL_NUMBER,
+  CHAR_DIS_SOFTWARE_REVISION,
   CHAR_F001,
   CHAR_F002,
   CHAR_F003,
@@ -448,34 +452,63 @@ export class LinxBleClient extends EventTarget {
   }
 
   async requestDeviceInformation(): Promise<void> {
+    let service: BluetoothRemoteGATTService;
     try {
-      const service = await this.runGattOperation(() => this.requireServer().getPrimaryService(SERVICE_DIS));
-      const firmwareVersion = await this.readDeviceInformationString(
-        service,
-        CHAR_DIS_FIRMWARE_REVISION,
-        'версия прошивки',
-      );
-
-      if (firmwareVersion) {
-        this.updateSensorInfo({ firmwareVersion });
-        this.log(`PARSE DIS ${shortUuid(CHAR_DIS_FIRMWARE_REVISION)}: firmware=${firmwareVersion}`);
-      }
+      service = await this.runGattOperation(() => this.requireServer().getPrimaryService(SERVICE_DIS));
     } catch (error) {
       this.log(`DIS ${shortUuid(SERVICE_DIS)} unavailable: ${describeError(error)}`, 'warn');
+      return;
+    }
+
+    await this.readOptionalDeviceInformationString(service, CHAR_DIS_MANUFACTURER_NAME, 'производитель');
+
+    const modelName = await this.readOptionalDeviceInformationString(service, CHAR_DIS_MODEL_NUMBER, 'модель');
+    const serial = normalizeSerial(
+      await this.readOptionalDeviceInformationString(service, CHAR_DIS_SERIAL_NUMBER, 'серийный номер'),
+    );
+    const softwareRevision = await this.readOptionalDeviceInformationString(
+      service,
+      CHAR_DIS_SOFTWARE_REVISION,
+      'версия ПО',
+    );
+    const firmwareRevision = softwareRevision
+      ? ''
+      : await this.readOptionalDeviceInformationString(service, CHAR_DIS_FIRMWARE_REVISION, 'версия прошивки');
+    const firmwareVersion = softwareRevision || firmwareRevision;
+    const patch: Partial<SensorInfo> = {};
+
+    if (modelName) {
+      patch.modelName = modelName;
+    }
+    if (serial) {
+      this.serial = serial;
+      patch.serial = serial;
+    }
+    if (firmwareVersion) {
+      patch.firmwareVersion = firmwareVersion;
+    }
+
+    if (Object.keys(patch).length > 0) {
+      this.updateSensorInfo(patch);
     }
   }
 
-  async readDeviceInformationString(
+  async readOptionalDeviceInformationString(
     service: BluetoothRemoteGATTService,
     uuid: string,
     description: string,
   ): Promise<string> {
-    this.log(formatControlLine('TX', uuid, 'read', description));
-    const characteristic = await this.runGattOperation(() => service.getCharacteristic(uuid));
-    const bytes = dataViewToBytes(await this.runGattOperation(() => characteristic.readValue()));
-    const value = decodeGattString(bytes);
-    this.log(formatTraceLine('RX', uuid, bytes, value ? `${description}: ${value}` : description, 'read'));
-    return value;
+    try {
+      this.log(formatControlLine('TX', uuid, 'read', description));
+      const characteristic = await this.runGattOperation(() => service.getCharacteristic(uuid));
+      const bytes = dataViewToBytes(await this.runGattOperation(() => characteristic.readValue()));
+      const value = decodeGattString(bytes);
+      this.log(formatTraceLine('RX', uuid, bytes, value ? `${description}: ${value}` : description, 'read'));
+      return value;
+    } catch (error) {
+      this.log(`DIS ${shortUuid(uuid)} unavailable: ${describeError(error)}`, 'warn');
+      return '';
+    }
   }
 
   disconnect(): void {

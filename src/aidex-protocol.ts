@@ -444,17 +444,31 @@ function responsePayloadCandidates(data: ByteInput): Uint8Array[] {
 function parseStartupDeviceInfoPayload(payload: Uint8Array): StartupDeviceInfo | null {
   if (payload.length < 16 || u16LE(payload, 0) !== 0) return null;
 
-  const fwMajor = payload[2];
-  const fwMinor = payload[3];
-  const hwMajor = payload[4];
-  const hwMinor = payload[5];
-  const wearDays = payload[6];
-  const modelName = asciiNullTerminated(payload.slice(8)).trim();
+  return parseStartupDeviceInfoLayout(payload, true) ??
+    parseStartupDeviceInfoLayout(payload, false);
+}
 
-  if (!modelName) return null;
+function parseStartupDeviceInfoLayout(payload: Uint8Array, hasFirmwarePatch: boolean): StartupDeviceInfo | null {
+  const firmwareOffset = 2;
+  const hardwareOffset = hasFirmwarePatch ? 5 : 4;
+  const wearOffset = hasFirmwarePatch ? 7 : 6;
+  const modelOffsetCandidate = wearOffset + 1;
+  const modelOffset = payload[modelOffsetCandidate] === 0 ? modelOffsetCandidate + 1 : modelOffsetCandidate;
+
+  if (payload.length <= modelOffset) return null;
+
+  const firmwareParts = hasFirmwarePatch
+    ? [payload[firmwareOffset], payload[firmwareOffset + 1], payload[firmwareOffset + 2]]
+    : [payload[firmwareOffset], payload[firmwareOffset + 1]];
+  const hwMajor = payload[hardwareOffset];
+  const hwMinor = payload[hardwareOffset + 1];
+  const wearDays = payload[wearOffset];
+  const modelName = asciiNullTerminated(payload.slice(modelOffset)).trim();
+
+  if (!modelName || wearDays < 1 || wearDays > 31) return null;
 
   return {
-    firmwareVersion: `${fwMajor}.${fwMinor}`,
+    firmwareVersion: firmwareParts.join('.'),
     hardwareVersion: `${hwMajor}.${hwMinor}`,
     wearDays,
     modelName,

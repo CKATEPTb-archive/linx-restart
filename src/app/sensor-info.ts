@@ -27,7 +27,6 @@ export function emptySensorInfo(): SensorInfo {
 export function sensorRows(info: SensorInfo, nowMs: number): SensorRow[] {
   const startMs = finiteNumber(info.startTimeMs);
   const ageMinutes = finiteNumber(info.ageMinutes);
-  const batteryMillivolts = finiteNumber(info.batteryMillivolts);
   const expiryMs = startMs !== null ? startMs + AIDEX_OFFICIAL_LIFETIME_DAYS * DAY_MS : null;
   const ageMs = startMs !== null
     ? Math.max(0, nowMs - startMs)
@@ -53,10 +52,6 @@ export function sensorRows(info: SensorInfo, nowMs: number): SensorRow[] {
     {
       label: 'Возраст',
       value: info.notStarted ? 'нет запуска' : formatDuration(ageMs),
-    },
-    {
-      label: 'Батарея',
-      value: batteryMillivolts !== null ? `${(batteryMillivolts / 1000).toFixed(3)} V` : 'ожидаем данные',
     },
     {
       label: 'Модель',

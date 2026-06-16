@@ -66,12 +66,22 @@ export const DEVICE_NAME_PREFIXES = [
   'Linx Vista',
   'LINX VISTA',
   'LINX Vista',
+  'LinXVista',
+  'LinxVista',
+  'LINXVISTA',
+  'LinX-Vista',
+  'Linx-Vista',
+  'LINX-VISTA',
+  'LinX_Vista',
+  'Linx_Vista',
+  'LINX_VISTA',
   'LinX',
   'LINX',
   'Linx',
   'AiDEX',
   'AiDex',
   'AIDEX',
+  'CGM',
   'Lumiflex',
   'LumiFlex',
   'LUMIFLEX',
@@ -142,6 +152,10 @@ export function isKnownDeviceName(name: unknown): boolean {
 
 export function bluetoothRequestFilters(): BluetoothLEScanFilter[] {
   return DEVICE_NAME_PREFIXES.map((namePrefix) => ({ namePrefix }));
+}
+
+export function bluetoothServiceRequestFilters(): BluetoothLEScanFilter[] {
+  return [{ services: [SERVICE_F000] }];
 }
 
 export function inferDeviceModelFromName(name: unknown): string {

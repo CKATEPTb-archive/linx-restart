@@ -6,6 +6,8 @@ import {
   deriveSecret,
   aesCfb128Decrypt,
   aesCfb128Encrypt,
+  inferDeviceModelFromName,
+  isKnownDeviceName,
   makeCommand,
   normalizeSerial,
   parseF003DataFrame,
@@ -24,6 +26,9 @@ import {
 
 assert.equal(bytesToHex(md5(new TextEncoder().encode('')), ''), 'D41D8CD98F00B204E9800998ECF8427E');
 assert.equal(normalizeSerial('AiDEX X-2222267V4E'), '2222267V4E');
+assert.equal(isKnownDeviceName('LinXVista-222228BA5V'), true);
+assert.equal(inferDeviceModelFromName('LinXVista-222228BA5V'), 'LinX Vista');
+assert.equal(isKnownDeviceName('CGM-222228BA5V'), true);
 assert.equal(bytesToHex(deriveSecret('2222267V4E'), ''), '4B76169576DA80E4EEACF886230873D2');
 assert.equal(bytesToHex(deriveIv('2222267V4E'), ''), '14CB6A3A39B96C448EBC39185F70F8AA');
 

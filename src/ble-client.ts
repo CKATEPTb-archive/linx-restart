@@ -14,6 +14,7 @@ import {
   SERVICE_DIS,
   SERVICE_F000,
   bluetoothRequestFilters,
+  bluetoothServiceRequestFilters,
   bytesToHex,
   extractSerialFromName,
   inferDeviceModelFromName,
@@ -106,8 +107,11 @@ const TIMEOUTS = Object.freeze({
 const GATT_BUSY_RETRIES = 10;
 const GATT_BUSY_DELAY_MS = 300;
 const GATT_SETTLE_DELAY_MS = 700;
+const AUTH_CCCD_SETTLE_DELAY_MS = 1_500;
 const CONNECT_RETRIES = 2;
 const CONNECT_RETRY_DELAY_MS = 1_500;
+const F002_READ_FALLBACK_DELAY_MS = 350;
+const F002_READ_FALLBACK_INTERVAL_MS = 550;
 const CCCD_ORDER = [CHAR_F003, CHAR_F002, CHAR_F001];
 
 export class LinxBleClient extends EventTarget {
@@ -152,37 +156,78 @@ export class LinxBleClient extends EventTarget {
 
   async chooseDevice(): Promise<BluetoothDevice> {
     const bluetooth = this.assertBluetoothSupport();
+    const device = await this.requestDeviceWithFallbacks(bluetooth);
+    this.setDevice(device, 'chooser');
+    return device;
+  }
 
-    let device: BluetoothDevice;
-    try {
-      device = await bluetooth.requestDevice({
-        filters: bluetoothRequestFilters(),
-        optionalServices: [SERVICE_F000, SERVICE_DIS],
-      });
-    } catch (error) {
-      if (!isUnknownCgmServiceError(error)) {
-        throw error;
-      }
-
-      this.log('WebBLE не принял сервис CGM/181F в optionalServices. Повторяю выбор только по имени устройства.', 'warn');
-      try {
-        device = await bluetooth.requestDevice({
-          filters: bluetoothRequestFilters(),
+  async requestDeviceWithFallbacks(bluetooth: Bluetooth): Promise<BluetoothDevice> {
+    const nameFilters = bluetoothRequestFilters();
+    const serviceFilters = bluetoothServiceRequestFilters();
+    const attempts: Array<{ label: string; options: RequestDeviceOptions }> = [
+      {
+        label: 'service+name optional 181F',
+        options: {
+          filters: [...serviceFilters, ...nameFilters],
+          optionalServices: [SERVICE_F000, SERVICE_DIS],
+        },
+      },
+      {
+        label: 'name optional 181F',
+        options: {
+          filters: nameFilters,
+          optionalServices: [SERVICE_F000, SERVICE_DIS],
+        },
+      },
+      {
+        label: 'name optional DIS',
+        options: {
+          filters: nameFilters,
           optionalServices: [SERVICE_DIS],
-        });
-      } catch (fallbackError) {
-        if (!isUnknownBluetoothServiceError(fallbackError)) {
-          throw fallbackError;
-        }
+        },
+      },
+      {
+        label: 'name only',
+        options: {
+          filters: nameFilters,
+        },
+      },
+      {
+        label: 'all optional 181F',
+        options: {
+          acceptAllDevices: true,
+          optionalServices: [SERVICE_F000, SERVICE_DIS],
+        },
+      },
+      {
+        label: 'all optional DIS',
+        options: {
+          acceptAllDevices: true,
+          optionalServices: [SERVICE_DIS],
+        },
+      },
+      {
+        label: 'all devices',
+        options: {
+          acceptAllDevices: true,
+        },
+      },
+    ];
 
-        device = await bluetooth.requestDevice({
-          filters: bluetoothRequestFilters(),
-        });
+    let lastError: unknown;
+    for (const attempt of attempts) {
+      try {
+        return await bluetooth.requestDevice(attempt.options);
+      } catch (error) {
+        if (isBluetoothChooserCancelled(error)) {
+          throw error;
+        }
+        lastError = error;
+        this.log(`BLE chooser fallback: ${attempt.label}: ${describeError(error)}`, 'warn');
       }
     }
 
-    this.setDevice(device, 'chooser');
-    return device;
+    throw normalizeError(lastError, 'Не удалось выбрать BLE устройство');
   }
 
   async startAdvertisementScan(): Promise<BluetoothLEScan | null> {
@@ -201,7 +246,7 @@ export class LinxBleClient extends EventTarget {
       const device = event.device;
       const name = device?.name || event.name || 'Без имени';
       const manufacturerIds = event.manufacturerData ? Array.from(event.manufacturerData.keys()) : [];
-      const serviceMatch = event.uuids?.some((uuid: string) => uuid.toLowerCase() === SERVICE_F000) || false;
+      const serviceMatch = event.uuids?.some((uuid: string) => sameBluetoothUuid(uuid, SERVICE_F000)) || false;
       const nameMatch = isKnownDeviceName(name);
 
       if (!nameMatch && !serviceMatch && manufacturerIds.length === 0) {
@@ -222,10 +267,21 @@ export class LinxBleClient extends EventTarget {
     };
 
     bluetooth.addEventListener('advertisementreceived', this.scanHandler);
-    this.scan = await bluetooth.requestLEScan({
-      filters: bluetoothRequestFilters(),
-      keepRepeatedDevices: false,
-    });
+    try {
+      this.scan = await bluetooth.requestLEScan({
+        filters: [...bluetoothServiceRequestFilters(), ...bluetoothRequestFilters()],
+        keepRepeatedDevices: false,
+      });
+    } catch (error) {
+      if (!isUnknownCgmServiceError(error) && !isUnknownBluetoothServiceError(error)) {
+        throw error;
+      }
+      this.log(`BLE scan fallback: ${describeError(error)}`, 'warn');
+      this.scan = await bluetooth.requestLEScan({
+        filters: bluetoothRequestFilters(),
+        keepRepeatedDevices: false,
+      });
+    }
     this.log('BLE scan: start');
     return this.scan;
   }
@@ -384,7 +440,7 @@ export class LinxBleClient extends EventTarget {
 
     const f002 = this.requireCharacteristic(CHAR_F002);
     const commandBuilder = this.requireCommandBuilder();
-    const clearAck = this.waitForF002Opcode(OPCODES.CLEAR_STORAGE, TIMEOUTS.commandAck);
+    const clearAck = this.waitForF002OpcodeWithReadFallback(OPCODES.CLEAR_STORAGE, TIMEOUTS.commandAck);
     await this.writeCharacteristic(f002, await commandBuilder.clearStorage(), opcodeDescription(OPCODES.CLEAR_STORAGE), 'enc');
     const clearResponse = await clearAck;
     const clearPlain = requirePlainPacket(clearResponse);
@@ -395,7 +451,7 @@ export class LinxBleClient extends EventTarget {
       throw new Error(`CLEAR_STORAGE вернул статус 0x${clearStatus.toString(16).padStart(2, '0')}`);
     }
 
-    const resetAck = this.waitForF002Opcode(OPCODES.RESET, TIMEOUTS.commandAck);
+    const resetAck = this.waitForF002OpcodeWithReadFallback(OPCODES.RESET, TIMEOUTS.commandAck);
     await this.writeCharacteristic(f002, await commandBuilder.reset(), opcodeDescription(OPCODES.RESET), 'enc');
 
     try {
@@ -442,7 +498,7 @@ export class LinxBleClient extends EventTarget {
   async requestOptionalF002Info(opcode: number, buildCommand: F002CommandBuilder, label: string): Promise<void> {
     try {
       const f002 = this.requireCharacteristic(CHAR_F002);
-      const responsePromise = this.waitForF002Opcode(opcode, TIMEOUTS.sensorInfo);
+      const responsePromise = this.waitForF002OpcodeWithReadFallback(opcode, TIMEOUTS.sensorInfo);
       await this.writeCharacteristic(f002, await buildCommand(), opcodeDescription(opcode), 'enc');
       const response = await responsePromise;
       this.applyF002SensorInfo(response);
@@ -582,7 +638,7 @@ export class LinxBleClient extends EventTarget {
         markGattStageError(error, `cccd:${shortUuid(uuid)}`, uuid === CHAR_F001);
         throw error;
       }
-      await delay(GATT_SETTLE_DELAY_MS);
+      await delay(uuid === CHAR_F001 ? AUTH_CCCD_SETTLE_DELAY_MS : GATT_SETTLE_DELAY_MS);
     }
   }
 
@@ -791,6 +847,68 @@ export class LinxBleClient extends EventTarget {
       (packet) => packet.uuid === CHAR_F002 && packet.plain?.[0] === opcode,
       timeoutMs,
     );
+  }
+
+  waitForF002OpcodeWithReadFallback(opcode: number, timeoutMs: number): Promise<LinxPacket> {
+    const notificationPromise = this.waitForF002Opcode(opcode, timeoutMs);
+    let settled = false;
+    notificationPromise
+      .catch(() => undefined)
+      .finally(() => {
+        settled = true;
+      });
+
+    const readFallbackPromise = (async () => {
+      const deadline = Date.now() + timeoutMs;
+      await delay(Math.min(F002_READ_FALLBACK_DELAY_MS, timeoutMs));
+
+      while (!settled && this.connected && Date.now() < deadline) {
+        try {
+          const packet = await this.readF002Fallback(opcode);
+          if (packet.plain?.[0] === opcode) {
+            return packet;
+          }
+        } catch (error) {
+          if (!settled) {
+            this.log(`F002 read fallback ${opcodeHex(opcode)}: ${describeError(error)}`, 'warn');
+          }
+        }
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
+        await delay(Math.min(F002_READ_FALLBACK_INTERVAL_MS, remainingMs));
+      }
+
+      return notificationPromise;
+    })();
+
+    return Promise.race([notificationPromise, readFallbackPromise]);
+  }
+
+  async readF002Fallback(opcode: number): Promise<LinxPacket> {
+    const f002 = this.requireCharacteristic(CHAR_F002);
+    this.log(formatControlLine('TX', CHAR_F002, 'read', `fallback ${opcodeHex(opcode)}`));
+    const raw = dataViewToBytes(await this.runGattOperation(() => f002.readValue()));
+    this.log(formatTraceLine('RX', CHAR_F002, raw, `fallback ${opcodeHex(opcode)}`, 'read'));
+
+    let plain: Uint8Array | null = null;
+    if (this.authenticated) {
+      plain = await this.requireKeyExchange().decrypt(raw);
+      this.log(formatTraceLine('RX', CHAR_F002, plain, plainPacketDescription(CHAR_F002, plain), 'plain'));
+    }
+
+    const packet: LinxPacket = {
+      uuid: CHAR_F002,
+      raw,
+      plain,
+      opcode: plain?.[0],
+    };
+
+    if (plain) {
+      this.applyF002SensorInfo(packet);
+    }
+    this.resolveWaiters(packet);
+    return packet;
   }
 
   waitForPacket(predicate: (packet: LinxPacket) => boolean, timeoutMs: number): Promise<LinxPacket> {
@@ -1054,11 +1172,23 @@ async function writeRawCharacteristic(
   bytes: ByteInput,
 ): Promise<CharacteristicWriteMethodName> {
   const payload = toWritePayload(bytes);
-  const attempts = [
-    ['writeValue', characteristic.writeValue?.bind(characteristic)],
-    ['writeValueWithResponse', characteristic.writeValueWithResponse?.bind(characteristic)],
-    ['writeValueWithoutResponse', characteristic.writeValueWithoutResponse?.bind(characteristic)],
-  ].filter((entry): entry is [CharacteristicWriteMethodName, CharacteristicWriteMethod] => typeof entry[1] === 'function');
+  const writeValue = characteristic.writeValue?.bind(characteristic);
+  const writeWithResponse = characteristic.writeValueWithResponse?.bind(characteristic);
+  const writeWithoutResponse = characteristic.writeValueWithoutResponse?.bind(characteristic);
+  const rawAttempts: Array<[CharacteristicWriteMethodName, CharacteristicWriteMethod | undefined]> =
+    sameBluetoothUuid(characteristic.uuid, CHAR_F002)
+      ? [
+        ['writeValueWithoutResponse', writeWithoutResponse],
+        ['writeValueWithResponse', writeWithResponse],
+        ['writeValue', writeValue],
+      ]
+      : [
+        ['writeValue', writeValue],
+        ['writeValueWithResponse', writeWithResponse],
+        ['writeValueWithoutResponse', writeWithoutResponse],
+      ];
+  const attempts = rawAttempts
+    .filter((entry): entry is [CharacteristicWriteMethodName, CharacteristicWriteMethod] => typeof entry[1] === 'function');
 
   if (attempts.length === 0) {
     throw new Error('Characteristic не поддерживает методы записи');
@@ -1215,6 +1345,14 @@ function isUnknownCgmServiceError(error: unknown): boolean {
     text.includes('0x181f') ||
     text.includes(SERVICE_F000);
   return mentionsCgm && isUnknownBluetoothServiceError(error);
+}
+
+function isBluetoothChooserCancelled(error: unknown): boolean {
+  const text = errorSearchText(error);
+  return text.includes('user cancelled') ||
+    text.includes('user canceled') ||
+    text.includes('cancelled by user') ||
+    text.includes('canceled by user');
 }
 
 function isUnknownBluetoothServiceError(error: unknown): boolean {

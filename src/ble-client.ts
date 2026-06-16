@@ -97,6 +97,11 @@ type CharacteristicWriteMethod = (value: BufferSource) => Promise<void>;
 type TraceDirection = 'TX' | 'RX';
 type TraceEncoding = 'raw' | 'enc' | 'plain' | 'read' | 'cccd';
 
+interface ConnectionRetryPlan {
+  delayMs: number;
+  message: string;
+}
+
 const TIMEOUTS = Object.freeze({
   pairKey: 20_000,
   bond: 12_000,
@@ -108,6 +113,8 @@ const GATT_BUSY_RETRIES = 10;
 const GATT_BUSY_DELAY_MS = 300;
 const GATT_SETTLE_DELAY_MS = 700;
 const AUTH_CCCD_SETTLE_DELAY_MS = 1_500;
+const ANDROID_AUTH_CCCD_SETTLE_DELAY_MS = 4_000;
+const F001_CCCD_SECURITY_RETRY_DELAY_MS = 4_000;
 const CONNECT_RETRIES = 2;
 const CONNECT_RETRY_DELAY_MS = 1_500;
 const F002_READ_FALLBACK_DELAY_MS = 350;
@@ -367,14 +374,12 @@ export class LinxBleClient extends EventTarget {
         return;
       } catch (error) {
         const isF001CccdFailure = Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
-        const canRetryTransport = !isF001CccdFailure &&
-          isGattDisconnectedError(error) &&
-          attempt < CONNECT_RETRIES;
+        const retryPlan = connectionRetryPlan(error, stage, attempt);
 
-        if (canRetryTransport) {
-          this.log(`GATT retry: stage=${describeStage(stage)} attempt=${attempt + 1}/${CONNECT_RETRIES}`, 'warn');
+        if (retryPlan) {
+          this.log(retryPlan.message, 'warn');
           this.closeGattSession();
-          await delay(CONNECT_RETRY_DELAY_MS * (attempt + 1));
+          await delay(retryPlan.delayMs);
           continue;
         }
 
@@ -638,7 +643,7 @@ export class LinxBleClient extends EventTarget {
         markGattStageError(error, `cccd:${shortUuid(uuid)}`, uuid === CHAR_F001);
         throw error;
       }
-      await delay(uuid === CHAR_F001 ? AUTH_CCCD_SETTLE_DELAY_MS : GATT_SETTLE_DELAY_MS);
+      await delay(uuid === CHAR_F001 ? authCccdSettleDelayMs() : GATT_SETTLE_DELAY_MS);
     }
   }
 
@@ -1273,6 +1278,40 @@ function describeStage(stage: ConnectionStage): string {
     default:
       return stage;
   }
+}
+
+function connectionRetryPlan(error: unknown, stage: ConnectionStage, attempt: number): ConnectionRetryPlan | null {
+  if (!isGattDisconnectedError(error) || attempt >= CONNECT_RETRIES) {
+    return null;
+  }
+
+  const retryIndex = attempt + 1;
+  if (isF001CccdError(error)) {
+    return {
+      delayMs: F001_CCCD_SECURITY_RETRY_DELAY_MS,
+      message: `GATT retry: stage=CCCD F001 reason=security transition attempt=${retryIndex}/${CONNECT_RETRIES}`,
+    };
+  }
+
+  return {
+    delayMs: CONNECT_RETRY_DELAY_MS * retryIndex,
+    message: `GATT retry: stage=${describeStage(stage)} attempt=${retryIndex}/${CONNECT_RETRIES}`,
+  };
+}
+
+function isF001CccdError(error: unknown): boolean {
+  return Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
+}
+
+function authCccdSettleDelayMs(): number {
+  return isAndroidRuntime() ? ANDROID_AUTH_CCCD_SETTLE_DELAY_MS : AUTH_CCCD_SETTLE_DELAY_MS;
+}
+
+function isAndroidRuntime(): boolean {
+  if (typeof navigator === 'undefined') {
+    return false;
+  }
+  return navigator.userAgent.toLowerCase().includes('android');
 }
 
 function markGattStageError(error: unknown, stage: string, isF001Cccd: boolean): void {

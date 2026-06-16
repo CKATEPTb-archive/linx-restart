@@ -122,11 +122,15 @@ const TIMEOUTS = Object.freeze({
 const GATT_BUSY_RETRIES = 10;
 const GATT_BUSY_DELAY_MS = 300;
 const GATT_SETTLE_DELAY_MS = 700;
+const ANDROID_POST_CONNECT_SETTLE_DELAY_MS = 200;
 const AUTH_CCCD_SETTLE_DELAY_MS = 1_500;
-const ANDROID_AUTH_CCCD_SETTLE_DELAY_MS = 4_000;
-const F001_CCCD_SECURITY_RETRY_DELAY_MS = 4_000;
-const CONNECT_RETRIES = 2;
+const ANDROID_AUTH_CCCD_SETTLE_DELAY_MS = 6_000;
+const F001_CCCD_SECURITY_RETRY_DELAY_MS = 8_000;
+const CONNECT_RETRIES = 3;
 const CONNECT_RETRY_DELAY_MS = 1_500;
+const SERVICE_DISCOVERY_RETRIES = 2;
+const SERVICE_DISCOVERY_RETRY_DELAY_MS = 1_500;
+const ANDROID_F001_BOOTSTRAP_DELAY_MS = 1_500;
 const F002_READ_FALLBACK_DELAY_MS = 350;
 const F002_READ_FALLBACK_INTERVAL_MS = 550;
 const CLEAR_STORAGE_QUIET_WINDOW_MS = 12_000;
@@ -356,8 +360,13 @@ export class LinxBleClient extends EventTarget {
 
     this.serial = serial;
 
+    let pendingF001Bootstrap = shouldUseAndroidF001Bootstrap(device);
+    let f001BootstrapUsed = false;
+
     for (let attempt = 0; attempt <= CONNECT_RETRIES; attempt += 1) {
       let stage: ConnectionStage = 'connect';
+      const useF001Bootstrap = pendingF001Bootstrap;
+      pendingF001Bootstrap = false;
       this.closeGattSession();
       this.keyExchange = new AiDexKeyExchange(serial);
       this.commandBuilder = new AiDexCommandBuilder(this.keyExchange);
@@ -370,14 +379,22 @@ export class LinxBleClient extends EventTarget {
         }
 
         this.log(`GATT connect: name=${device.name || 'unknown'} id=${device.id}`);
-        this.log(`CCCD order: ${CCCD_ORDER.map(shortUuid).join(',')}`);
         this.server = await gatt.connect();
         stage = 'services';
+        await this.settleAfterConnect();
         this.service = await this.getAiDexService();
         stage = 'characteristics';
         await this.cacheCharacteristics();
         stage = 'cccd';
-        await this.enableNotifications();
+        await this.enableNotifications({ includeF001: !useF001Bootstrap });
+        if (useF001Bootstrap) {
+          f001BootstrapUsed = true;
+          await this.primeAndroidF001Bonding();
+          this.log('GATT retry: reconnect after F001 write bootstrap', 'warn');
+          this.closeGattSession();
+          await delay(CONNECT_RETRY_DELAY_MS);
+          continue;
+        }
         stage = 'key-exchange';
         await this.performKeyExchange();
         this.dispatchEvent(new CustomEvent('phase', { detail: { phase: 'key' } }));
@@ -387,6 +404,14 @@ export class LinxBleClient extends EventTarget {
         return;
       } catch (error) {
         const isF001CccdFailure = Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
+        if (isF001CccdFailure && shouldRetryWithAndroidF001Bootstrap(device, f001BootstrapUsed)) {
+          pendingF001Bootstrap = true;
+          this.log('GATT retry: F001 CCCD failed; next attempt uses F001 write bootstrap', 'warn');
+          this.closeGattSession();
+          await delay(CONNECT_RETRY_DELAY_MS);
+          continue;
+        }
+
         const retryPlan = connectionRetryPlan(error, stage, attempt);
 
         if (retryPlan) {
@@ -419,6 +444,30 @@ export class LinxBleClient extends EventTarget {
   }
 
   async getAiDexService(): Promise<BluetoothRemoteGATTService> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= SERVICE_DISCOVERY_RETRIES; attempt += 1) {
+      try {
+        return await this.resolveAiDexService();
+      } catch (error) {
+        lastError = error;
+        if (!isServiceDiscoveryRetryableError(error) || attempt === SERVICE_DISCOVERY_RETRIES || !this.connected) {
+          throw error;
+        }
+
+        const retryIndex = attempt + 1;
+        this.log(
+          `GATT service retry: attempt=${retryIndex}/${SERVICE_DISCOVERY_RETRIES} reason=${describeError(error)}`,
+          'warn',
+        );
+        await delay(SERVICE_DISCOVERY_RETRY_DELAY_MS);
+      }
+    }
+
+    throw normalizeError(lastError, 'Сервис 181F не найден');
+  }
+
+  async resolveAiDexService(): Promise<BluetoothRemoteGATTService> {
     const server = this.requireServer();
     try {
       return await this.runGattOperation(() => server.getPrimaryService(SERVICE_F000));
@@ -449,6 +498,16 @@ export class LinxBleClient extends EventTarget {
 
       return service;
     }
+  }
+
+  async settleAfterConnect(): Promise<void> {
+    const delayMs = postConnectSettleDelayMs();
+    if (delayMs <= 0) {
+      return;
+    }
+
+    this.log(`GATT settle: ${delayMs}ms`);
+    await delay(delayMs);
   }
 
   async resetSensor(): Promise<{ confirmed: boolean }> {
@@ -739,13 +798,17 @@ export class LinxBleClient extends EventTarget {
     for (const uuid of [CHAR_F001, CHAR_F002, CHAR_F003]) {
       const characteristic = await this.service.getCharacteristic(uuid);
       this.characteristics.set(uuid, characteristic);
+      this.log(`GATT char ${shortUuid(uuid)} props=${characteristicPropertiesDescription(characteristic)}`);
     }
   }
 
-  async enableNotifications(): Promise<void> {
+  async enableNotifications(options: { includeF001?: boolean } = {}): Promise<void> {
     this.detachNotificationHandlers();
+    const order = notificationOrder(options.includeF001 !== false);
+    const suffix = options.includeF001 === false ? ' (F001 skipped for bootstrap)' : '';
+    this.log(`CCCD order: ${order.map(shortUuid).join(',')}${suffix}`);
 
-    for (const uuid of CCCD_ORDER) {
+    for (const uuid of order) {
       const characteristic = this.requireCharacteristic(uuid);
       this.attachNotificationHandler(uuid, characteristic);
       this.log(formatControlLine('TX', uuid, 'cccd', 'enable notify'));
@@ -758,6 +821,20 @@ export class LinxBleClient extends EventTarget {
       }
       await delay(uuid === CHAR_F001 ? authCccdSettleDelayMs() : GATT_SETTLE_DELAY_MS);
     }
+  }
+
+  async primeAndroidF001Bonding(): Promise<void> {
+    const f001 = this.requireCharacteristic(CHAR_F001);
+    const keyExchange = this.requireKeyExchange();
+    this.log('GATT F001 bootstrap: write challenge before CCCD', 'warn');
+    await this.writeCharacteristic(
+      f001,
+      keyExchange.getChallenge(),
+      'pair bootstrap',
+      'raw',
+      'without-response-first',
+    );
+    await delay(ANDROID_F001_BOOTSTRAP_DELAY_MS);
   }
 
   attachNotificationHandler(uuid: string, characteristic: BluetoothRemoteGATTCharacteristic): void {
@@ -845,7 +922,13 @@ export class LinxBleClient extends EventTarget {
       throw new Error('BOND не расшифрован или CRC-8 не совпал');
     }
 
-    await this.writeCharacteristic(f001, await keyExchange.postBondConfig(), 'bond config', 'enc');
+    await this.writeCharacteristic(
+      f001,
+      await keyExchange.postBondConfig(),
+      'bond config',
+      'enc',
+      postBondConfigWritePreference(),
+    );
     await delay(500);
     await this.refreshPostBondNotifications();
   }
@@ -1433,6 +1516,23 @@ function shortUuid(uuid: string): string {
   return uuid.slice(4, 8).toUpperCase();
 }
 
+function characteristicPropertiesDescription(characteristic: BluetoothRemoteGATTCharacteristic): string {
+  const properties = characteristic.properties;
+  if (!properties) {
+    return 'unknown';
+  }
+
+  const enabled = [
+    ['read', properties.read],
+    ['write', properties.write],
+    ['writeNoResp', properties.writeWithoutResponse],
+    ['notify', properties.notify],
+    ['indicate', properties.indicate],
+  ].filter(([, value]) => value).map(([name]) => name);
+
+  return enabled.length > 0 ? enabled.join('|') : 'none';
+}
+
 function sameBluetoothUuid(left: string, right: string): boolean {
   return normalizeBluetoothUuid(left) === normalizeBluetoothUuid(right);
 }
@@ -1488,6 +1588,32 @@ function isF001CccdError(error: unknown): boolean {
   return Boolean((error as Partial<LinxGattError> | undefined)?.linxF001Cccd);
 }
 
+function notificationOrder(includeF001: boolean): string[] {
+  return includeF001 ? CCCD_ORDER : CCCD_ORDER.filter((uuid) => uuid !== CHAR_F001);
+}
+
+function isServiceDiscoveryRetryableError(error: unknown): boolean {
+  const text = errorSearchText(error);
+  return isGattBusyError(error) ||
+    isGattDisconnectedError(error) ||
+    text.includes('notfounderror') ||
+    text.includes('no services') ||
+    text.includes('service not found') ||
+    text.includes('service 181f');
+}
+
+function shouldUseAndroidF001Bootstrap(device: BluetoothDevice): boolean {
+  return isAndroidRuntime() && isAiDexXDeviceName(device.name);
+}
+
+function shouldRetryWithAndroidF001Bootstrap(device: BluetoothDevice, f001BootstrapUsed: boolean): boolean {
+  return !f001BootstrapUsed && shouldUseAndroidF001Bootstrap(device);
+}
+
+function isAiDexXDeviceName(name: unknown): boolean {
+  return /\baidex\s*x\b/i.test(String(name || ''));
+}
+
 function pairChallengeAttempts(): PairChallengeAttempt[] {
   if (!isAndroidRuntime()) {
     return [
@@ -1502,15 +1628,23 @@ function pairChallengeAttempts(): PairChallengeAttempt[] {
   return [
     {
       description: 'pair challenge',
-      timeoutMs: TIMEOUTS.pairKeyFirstAttempt,
-      writePreference: 'with-response-first',
-    },
-    {
-      description: 'pair challenge retry no-response',
       timeoutMs: TIMEOUTS.pairKeyRetry,
       writePreference: 'without-response-first',
     },
+    {
+      description: 'pair challenge retry with-response',
+      timeoutMs: TIMEOUTS.pairKeyFirstAttempt,
+      writePreference: 'with-response-first',
+    },
   ];
+}
+
+function postBondConfigWritePreference(): CharacteristicWritePreference {
+  return isAndroidRuntime() ? 'without-response-first' : 'default';
+}
+
+function postConnectSettleDelayMs(): number {
+  return isAndroidRuntime() ? ANDROID_POST_CONNECT_SETTLE_DELAY_MS : 0;
 }
 
 function authCccdSettleDelayMs(): number {

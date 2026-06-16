@@ -1,6 +1,7 @@
 import {
   AiDexCommandBuilder,
   AiDexKeyExchange,
+  CHAR_DIS_FIRMWARE_REVISION,
   CHAR_F001,
   CHAR_F002,
   CHAR_F003,
@@ -160,9 +161,20 @@ export class LinxBleClient extends EventTarget {
       }
 
       this.log('WebBLE не принял сервис CGM/181F в optionalServices. Повторяю выбор только по имени устройства.', 'warn');
-      device = await bluetooth.requestDevice({
-        filters: bluetoothRequestFilters(),
-      });
+      try {
+        device = await bluetooth.requestDevice({
+          filters: bluetoothRequestFilters(),
+          optionalServices: [SERVICE_DIS],
+        });
+      } catch (fallbackError) {
+        if (!isUnknownBluetoothServiceError(fallbackError)) {
+          throw fallbackError;
+        }
+
+        device = await bluetooth.requestDevice({
+          filters: bluetoothRequestFilters(),
+        });
+      }
     }
 
     this.setDevice(device, 'chooser');
@@ -419,6 +431,8 @@ export class LinxBleClient extends EventTarget {
       () => commandBuilder.getLocalStartTime(),
       'время запуска 0x21',
     );
+
+    await this.requestDeviceInformation();
   }
 
   async requestOptionalF002Info(opcode: number, buildCommand: F002CommandBuilder, label: string): Promise<void> {
@@ -431,6 +445,37 @@ export class LinxBleClient extends EventTarget {
     } catch (error) {
       this.log(`Не удалось получить ${label}: ${describeError(error)}`, 'warn');
     }
+  }
+
+  async requestDeviceInformation(): Promise<void> {
+    try {
+      const service = await this.runGattOperation(() => this.requireServer().getPrimaryService(SERVICE_DIS));
+      const firmwareVersion = await this.readDeviceInformationString(
+        service,
+        CHAR_DIS_FIRMWARE_REVISION,
+        'версия прошивки',
+      );
+
+      if (firmwareVersion) {
+        this.updateSensorInfo({ firmwareVersion });
+        this.log(`PARSE DIS ${shortUuid(CHAR_DIS_FIRMWARE_REVISION)}: firmware=${firmwareVersion}`);
+      }
+    } catch (error) {
+      this.log(`DIS ${shortUuid(SERVICE_DIS)} unavailable: ${describeError(error)}`, 'warn');
+    }
+  }
+
+  async readDeviceInformationString(
+    service: BluetoothRemoteGATTService,
+    uuid: string,
+    description: string,
+  ): Promise<string> {
+    this.log(formatControlLine('TX', uuid, 'read', description));
+    const characteristic = await this.runGattOperation(() => service.getCharacteristic(uuid));
+    const bytes = dataViewToBytes(await this.runGattOperation(() => characteristic.readValue()));
+    const value = decodeGattString(bytes);
+    this.log(formatTraceLine('RX', uuid, bytes, value ? `${description}: ${value}` : description, 'read'));
+    return value;
   }
 
   disconnect(): void {
@@ -853,6 +898,13 @@ function dataViewToBytes(view: DataView): Uint8Array {
   return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
 }
 
+function decodeGattString(bytes: Uint8Array): string {
+  return new TextDecoder('utf-8')
+    .decode(bytes)
+    .replace(/\0+$/g, '')
+    .trim();
+}
+
 function requirePlainPacket(packet: LinxPacket): Uint8Array {
   if (!packet.plain) {
     throw new Error('Ответ сенсора не расшифрован');
@@ -1129,8 +1181,12 @@ function isUnknownCgmServiceError(error: unknown): boolean {
     text.includes('181f') ||
     text.includes('0x181f') ||
     text.includes(SERVICE_F000);
-  return mentionsCgm &&
-    (text.includes('unknown service') || text.includes('unknown service name'));
+  return mentionsCgm && isUnknownBluetoothServiceError(error);
+}
+
+function isUnknownBluetoothServiceError(error: unknown): boolean {
+  const text = errorSearchText(error);
+  return text.includes('unknown service') || text.includes('unknown service name');
 }
 
 function errorSearchText(error: unknown): string {

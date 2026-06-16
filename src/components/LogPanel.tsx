@@ -1,30 +1,42 @@
+import { Show } from 'solid-js';
 import type { Accessor } from 'solid-js';
 import type { LogSummary } from '../app/types';
 
 interface LogPanelProps {
   logSummary: Accessor<LogSummary>;
   logText: Accessor<string>;
+  open: Accessor<boolean>;
+  onClose: () => void;
 }
 
 export function LogPanel(props: LogPanelProps) {
   return (
-    <details class="group min-h-0 max-h-[28dvh] overflow-hidden rounded-2xl border border-white/[0.055] bg-app-panel/82 shadow-[0_10px_26px_rgba(0,0,0,0.16)]">
-      <summary class={`grid min-h-9 cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center gap-2 overflow-hidden px-3 py-2 text-xs font-extrabold leading-tight marker:hidden [&::-webkit-details-marker]:hidden ${summaryColor(props.logSummary().level)}`}>
-        <span class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{props.logSummary().text}</span>
-        <span class="rounded-full bg-white/[0.055] px-2 py-0.5 text-[10px] text-app-muted group-open:hidden">+</span>
-        <span class="hidden rounded-full bg-white/[0.055] px-2 py-0.5 text-[10px] text-app-muted group-open:inline">-</span>
-      </summary>
-      <pre
-        id="logOutput"
-        aria-live="polite"
-        class="m-0 max-h-[calc(28dvh-36px)] overflow-auto border-t border-white/[0.045] bg-black/16 px-3 py-2 font-mono text-[10px] leading-[1.35] whitespace-pre-wrap text-app-log"
-      >
-        {props.logText()}
-      </pre>
-    </details>
+    <Show when={props.open()}>
+      <section class="pointer-events-auto min-h-0 max-h-[42dvh] overflow-hidden rounded-2xl border border-white/[0.075] bg-app-panel/95 shadow-[0_20px_52px_rgba(0,0,0,0.46)] backdrop-blur-md">
+        <button
+          type="button"
+          onClick={props.onClose}
+          class={`grid min-h-9 w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 overflow-hidden px-3 py-2 text-left text-xs font-extrabold leading-tight transition-[background,transform,color] duration-150 hover:bg-white/[0.055] active:scale-[0.995] active:bg-white/[0.085] ${summaryColor(props.logSummary().level)}`}
+        >
+          <span class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{panelTitle(props.logSummary())}</span>
+          <span class="grid size-6 place-items-center rounded-full bg-white/[0.065] text-[13px] leading-none text-app-muted">x</span>
+        </button>
+        <pre
+          id="logOutput"
+          aria-live="polite"
+          class="m-0 max-h-[calc(42dvh-36px)] overflow-auto border-t border-white/[0.045] bg-black/18 px-3 py-2 font-mono text-[10px] leading-[1.35] whitespace-pre-wrap text-app-log"
+        >
+          {props.logText() || 'Журнал пуст'}
+        </pre>
+      </section>
+    </Show>
   );
 }
 
 function summaryColor(level: LogSummary['level']): string {
   return level === 'error' ? 'text-app-danger' : 'text-app-muted';
+}
+
+function panelTitle(summary: LogSummary): string {
+  return summary.text.replace(/^Показать журнал:?\s*/i, '') || 'Журнал';
 }

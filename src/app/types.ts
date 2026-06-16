@@ -44,8 +44,10 @@ export interface LinxResetViewModel {
   chooseDisabled: Accessor<boolean>;
   confirmAndReset: () => Promise<boolean>;
   connection: Accessor<ConnectionState>;
+  closeLog: () => void;
   logSummary: Accessor<LogSummary>;
   logText: Accessor<string>;
+  logOpen: Accessor<boolean>;
   platform: Accessor<PlatformInfo>;
   resetDisabled: Accessor<boolean>;
   resetSent: Accessor<boolean>;
@@ -53,4 +55,5 @@ export interface LinxResetViewModel {
   sensorRows: Accessor<SensorRow[]>;
   support: Accessor<SupportDetails>;
   supportIssue: Accessor<boolean>;
+  toggleLog: () => void;
 }

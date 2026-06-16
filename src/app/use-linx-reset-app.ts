@@ -38,6 +38,7 @@ export function useLinxResetApp(): LinxResetViewModel {
   const [resetSent, setResetSent] = createSignal(false);
   const [connection, setConnection] = createSignal<ConnectionState>({ label: 'Ожидание', mode: 'idle' });
   const [logText, setLogText] = createSignal('');
+  const [logOpen, setLogOpen] = createSignal(false);
   const [logSummary, setLogSummary] = createSignal<LogSummary>({ text: 'Показать журнал', level: 'info' });
   const [now, setNow] = createSignal(Date.now());
 
@@ -77,6 +78,14 @@ export function useLinxResetApp(): LinxResetViewModel {
     if (value) {
       setConnectionState(label, 'busy');
     }
+  }
+
+  function toggleLog(): void {
+    setLogOpen((current) => !current);
+  }
+
+  function closeLog(): void {
+    setLogOpen(false);
   }
 
   function rememberDevice(device: BluetoothDevice): string {
@@ -199,8 +208,10 @@ export function useLinxResetApp(): LinxResetViewModel {
     authenticated,
     chooseAndConnect,
     chooseDisabled,
+    closeLog,
     confirmAndReset,
     connection,
+    logOpen,
     logSummary,
     logText,
     platform,
@@ -210,6 +221,7 @@ export function useLinxResetApp(): LinxResetViewModel {
     sensorRows,
     support,
     supportIssue,
+    toggleLog,
   };
 }
 

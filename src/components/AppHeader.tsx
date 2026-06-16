@@ -4,6 +4,8 @@ import { StatusPill } from './StatusPill';
 
 interface AppHeaderProps {
   connection: Accessor<ConnectionState>;
+  logOpen: Accessor<boolean>;
+  onStatusClick: () => void;
   stepNumber: Accessor<number>;
   totalSteps: number;
 }
@@ -25,7 +27,11 @@ export function AppHeader(props: AppHeaderProps) {
           <span class="shrink-0 rounded-full bg-app-accent/12 px-2.5 py-1 text-[11px] font-black leading-none text-app-accent ring-1 ring-app-accent/22">
             Шаг {props.stepNumber()}/{props.totalSteps}
           </span>
-          <StatusPill connection={props.connection} />
+          <StatusPill
+            connection={props.connection}
+            logOpen={props.logOpen}
+            onClick={props.onStatusClick}
+          />
         </div>
       </div>
       <div class="h-1 overflow-hidden rounded-full bg-black/25 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.035)]">
